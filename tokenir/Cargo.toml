@@ -1,0 +1,27 @@
+[package]
+name = "tokenir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures-util = "0.3"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+dotenv = "0.15"
+solana-sdk = "2.1.1"
+solana-client = "=2.1.1"
+tokio-tungstenite = { version = "0.27.0", features = ["native-tls"]}
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+borsh = "1.5.7"
+base64 = "0.22.1"
+open = "5.0.0"
+reqwest = {version = "0.12.22", features = ["cookies", "json"]}
+rust_decimal = {version = "1.37.2", features = ["macros"]}
+sqlx = { version = "0.6.2", features = ["postgres", "runtime-tokio-rustls"]}
+human_format = "1.1.0"
+chrono = "0.4.41"
+axum = { version = "0.7", features = ["ws"] }
+uuid = { version = "1.7", features = ["v4", "serde"] }
+tower-http = { version = "0.5.0", features = ["cors"] }
+mpl-token-metadata = "5.1.1"
