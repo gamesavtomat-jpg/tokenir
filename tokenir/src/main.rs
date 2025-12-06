@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, ws::{Message, WebSocket, WebSocketUpgrade}, Query}, // Added Query
+    extract::{State, ws::{Message, WebSocket, WebSocketUpgrade}, Query},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -12,9 +12,10 @@ use std::net::SocketAddr;
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
+    collections::HashMap, // Added HashMap
 };
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use tokio::sync::{Mutex, Semaphore, broadcast};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc}; // Added mpsc
 use tower_http::cors::{Any, CorsLayer};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey};
@@ -37,6 +38,9 @@ use tokenir::logs::{BuyEvent, CreateEvent, Event};
 struct AppState {
     tx: broadcast::Sender<String>,
     db: Arc<Database>,
+    // Map of Access Key -> List of Kill Signals (Sender<()>)
+    // Using a Vec allows a user to have multiple tabs open with the same key
+    active_connections: Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>,
 }
 
 type SharedState = Arc<AppState>;
@@ -58,7 +62,6 @@ struct GetUsersReq {
     admin_key: String,
 }
 
-// --- NEW: Auth Struct for WebSocket ---
 #[derive(Deserialize)]
 struct WsAuth {
     key: String,
@@ -75,10 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = Arc::new(Database::new(std::env::var("SQL").unwrap()).await.unwrap());
     let _ = database.initialize_tables().await.unwrap();
 
-    // 2. Initialize Shared State
+    // 2. Initialize Shared State with the new connection map
     let shared_state = Arc::new(AppState { 
         tx,
-        db: database.clone() 
+        db: database.clone(),
+        active_connections: Mutex::new(HashMap::new()),
     });
 
     let token_amount = Arc::new(AtomicI64::new(0));
@@ -213,12 +217,34 @@ async fn add_user_handler(
     }
 }
 
+// --- MODIFIED: REMOVE USER + DISCONNECT ---
 async fn remove_user_handler(
     State(state): State<SharedState>,
     Json(req): Json<RemoveUserReq>,
 ) -> impl IntoResponse {
+    
+    // 1. Retrieve the API Key for this user ID *before* deletion so we know who to disconnect.
+    // NOTE: This assumes `db.get_user_key_by_id(id)` exists. If not, you need to implement a simple
+    // SELECT key FROM users WHERE id = ? query.
+    let target_key = state.db.get_key_by_id(req.user_id).await.ok();
+
+    // 2. Perform the database deletion
     match state.db.remove_user(&req.admin_key, req.user_id).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "removed"}))),
+        Ok(_) => {
+            // 3. If successful, find active connections for this key and trigger disconnect
+            if let Some(key) = target_key {
+                let mut map = state.active_connections.lock().await;
+                if let Some(senders) = map.remove(&key) {
+                    println!("[Admin] Removing user {}, disconnecting {} active sessions.", req.user_id, senders.len());
+                    for tx in senders {
+                        // Sending () triggers the kill switch in handle_socket
+                        let _ = tx.send(()).await; 
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({"status": "removed"})))
+        },
         Err(sqlx::Error::RowNotFound) => (
             StatusCode::FORBIDDEN, 
             Json(serde_json::json!({"error": "Invalid admin key or target not found/admin"}))
@@ -430,7 +456,7 @@ async fn process_create_event(
 // --- MODIFIED: WebSocket Handler with Authentication ---
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(auth): Query<WsAuth>, // Extract ?key=... from URL
+    Query(auth): Query<WsAuth>,
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
     // 1. Check Key Length
@@ -442,8 +468,8 @@ async fn ws_handler(
     // 2. Validate Key against Database
     match state.db.validate_user_key(&auth.key).await {
         Ok(true) => {
-            // Authorized
-            ws.on_upgrade(|socket| handle_socket(socket, state))
+            // Authorized - Pass the key to the socket handler so we can register it
+            ws.on_upgrade(move |socket| handle_socket(socket, state, auth.key))
         },
         Ok(false) => {
             // Key not found
@@ -458,23 +484,51 @@ async fn ws_handler(
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: SharedState) {
-    println!("[websocket] new client connected");
+// --- MODIFIED: Handle Socket with Kill Switch ---
+async fn handle_socket(socket: WebSocket, state: SharedState, key: String) {
+    println!("[websocket] new client connected: {}", &key);
+
+    // 1. Create a "Kill Switch" channel for this specific connection
+    let (tx_kill, mut rx_kill) = mpsc::channel::<()>(1);
+
+    // 2. Register this connection in the shared state
+    {
+        let mut map = state.active_connections.lock().await;
+        map.entry(key.clone()).or_default().push(tx_kill);
+    }
+
     let mut rx = state.tx.subscribe();
     let (mut sink, mut stream) = socket.split();
 
+    let shared_key = Arc::new(key.clone());
+
+    // 3. Send Task: Listens to BOTH the broadcast channel AND the kill signal
     let mut send_task = tokio::spawn(async move {
+        let key = shared_key.clone();
+        
         loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    if sink.send(Message::Text(msg)).await.is_err() {
-                        break;
+            tokio::select! {
+                // Normal Broadcast Message
+                msg_result = rx.recv() => {
+                    match msg_result {
+                        Ok(msg) => {
+                            if sink.send(Message::Text(msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(amount)) => {
+                            println!("[websocket] client lagged by {} msgs", amount);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(amount)) => {
-                    println!("[websocket] client lagged by {} msgs - skipping forward", amount);
-                }
-                Err(broadcast::error::RecvError::Closed) => {
+                // Kill Signal from Remove User Handler
+                _ = rx_kill.recv() => {
+                    println!("[websocket] force closing connection for deleted user: {}", &key);
+                    // Optionally send a Close message
+                    let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
             }
@@ -483,14 +537,31 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
 
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(_)) = stream.next().await {
+            // Keep connection alive, handle pings if necessary
         }
     });
 
+    // 4. Wait for either task to finish
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
-    println!("[websocket] client disconnected");
+
+    // 5. Cleanup: Remove this closed connection from the active list
+    {
+        let mut map = state.active_connections.lock().await;
+        let value = key.clone();
+        if let Some(connections) = map.get_mut(&key) {
+            // Remove channels that are closed (this loop has exited, so our rx_kill is dropped, closing the channel)
+            connections.retain(|tx| !tx.is_closed());
+            // If no connections left for this user, remove the key entry entirely
+            if connections.is_empty() {
+                map.remove(&key.clone());
+            }
+        }
+    }
+
+    println!("[websocket] client disconnected: {}", key);
 }
 
 async fn broadcast_token<T: Serialize + Clone>(data: T, state: SharedState) {

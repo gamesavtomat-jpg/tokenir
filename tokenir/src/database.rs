@@ -202,6 +202,19 @@ impl Database {
         &self.pool
     }
 
+    pub async fn get_key_by_id(&self, user_id: i32) -> Result<String, sqlx::Error> {
+        let pool = self.connection();
+        
+        let result: (String,) = sqlx::query_as(
+            "SELECT access_key FROM users WHERE id = $1"
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(result.0)
+    }
+
     pub async fn add_dev(&self, dev: String) -> Result<(), sqlx::Error> {
         let pool = self.connection();
         sqlx::query(
