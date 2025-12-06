@@ -1,15 +1,19 @@
 use eframe::egui;
 use egui::{Color32, FontId, RichText, ScrollArea};
+use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 use std::{
+    fs::File,
+    io::{Read, Write},
     str::FromStr,
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64},
+        Arc, RwLock, // Added RwLock
     },
 };
 use tokenir_ui::Token;
-use tokio::sync::Mutex;
+use tokio::sync::{watch::Sender, Mutex};
 
 use crate::{
     autobuy::{AutoBuyConfig, BuyAutomata},
@@ -17,6 +21,219 @@ use crate::{
     filter::{FilterSet, Filters, Tag},
     pool::{self, Pool},
 };
+
+// ... [KeyConfig struct remains the same] ...
+#[derive(Serialize, Deserialize)]
+pub struct KeyConfig {
+    pub access_key: String,
+}
+
+// ==============================================================================
+// 2. LAUNCHER (State Manager)
+// ==============================================================================
+
+pub struct Launcher {
+    state: AppState,
+
+    pool: Arc<Mutex<Pool>>,
+    blacklist: Arc<Mutex<Blacklist>>,
+    price: Arc<AtomicU64>,
+    total_token_count: Arc<AtomicI64>,
+    automata: Arc<Mutex<BuyAutomata>>,
+    config: Option<AutoBuyConfig>,
+
+    startup_tx: Sender<String>,
+    
+    // Added permission lock
+    is_logged_in: Arc<RwLock<bool>>, 
+}
+
+enum AppState {
+    Login {
+        input_key: String,
+        error_msg: Option<String>,
+    },
+    Running(MyApp),
+}
+
+impl Launcher {
+    pub fn new(
+        pool: Arc<Mutex<Pool>>,
+        blacklist: Arc<Mutex<Blacklist>>,
+        price: Arc<AtomicU64>,
+        total: Arc<AtomicI64>,
+        automata: Arc<Mutex<BuyAutomata>>,
+        config: Option<AutoBuyConfig>,
+        startup_tx: Sender<String>,
+        is_logged_in: Arc<RwLock<bool>>, // New argument
+    ) -> Self {
+        // 1. Try to load key.json
+        let loaded_key = if let Ok(mut file) = File::open("key.json") {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() {
+                serde_json::from_str::<KeyConfig>(&content).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 2. Determine initial state
+        let state = if let Some(k) = loaded_key {
+            // Key exists: Signal main thread
+            let _ = startup_tx.send(k.access_key.clone());
+            
+            // ALLOW BROWSER
+            if let Ok(mut guard) = is_logged_in.write() {
+                *guard = true;
+            }
+
+            let app = MyApp::new(
+                pool.clone(),
+                blacklist.clone(),
+                price.clone(),
+                total.clone(),
+                automata.clone(),
+                config.clone(),
+            );
+            AppState::Running(app)
+        } else {
+            // Key missing: Deny browser (default is false, but ensuring safety)
+            if let Ok(mut guard) = is_logged_in.write() {
+                *guard = false;
+            }
+            
+            AppState::Login {
+                input_key: String::new(),
+                error_msg: None,
+            }
+        };
+
+        Self {
+            state,
+            pool,
+            blacklist,
+            price,
+            total_token_count: total,
+            automata,
+            config,
+            startup_tx,
+            is_logged_in,
+        }
+    }
+}
+
+impl eframe::App for Launcher {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let mut next_state: Option<AppState> = None;
+
+        match &mut self.state {
+            // --- LOGIN SCREEN ---
+            AppState::Login {
+                input_key,
+                error_msg,
+            } => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.heading("Authentication Required");
+                        ui.add_space(20.0);
+                        ui.label("Please enter your ACCESS_KEY to continue:");
+
+                        let text_res = ui.add(
+                            egui::TextEdit::singleline(input_key)
+                                .password(true)
+                                .hint_text("Paste key here..."),
+                        );
+
+                        ui.add_space(10.0);
+
+                        if let Some(msg) = error_msg {
+                            ui.label(RichText::new(msg.clone()).color(Color32::RED));
+                            ui.add_space(5.0);
+                        }
+
+                        let clicked = ui.button("Save & Enter").clicked();
+                        let enter_pressed =
+                            text_res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        if clicked || enter_pressed {
+                            if input_key.trim().is_empty() {
+                                *error_msg = Some("Key cannot be empty".to_string());
+                            } else {
+                                let key_val = input_key.trim().to_string();
+                                let cfg = KeyConfig {
+                                    access_key: key_val.clone(),
+                                };
+
+                                match serde_json::to_string_pretty(&cfg) {
+                                    Ok(json) => {
+                                        match File::create("key.json") {
+                                            Ok(mut f) => {
+                                                if f.write_all(json.as_bytes()).is_ok() {
+                                                    // Success: signal main thread
+                                                    let _ = self.startup_tx.send(key_val);
+
+                                                    // ENABLE BROWSER
+                                                    if let Ok(mut guard) = self.is_logged_in.write() {
+                                                        *guard = true;
+                                                    }
+
+                                                    let app = MyApp::new(
+                                                        self.pool.clone(),
+                                                        self.blacklist.clone(),
+                                                        self.price.clone(),
+                                                        self.total_token_count.clone(),
+                                                        self.automata.clone(),
+                                                        self.config.clone(),
+                                                    );
+                                                    next_state = Some(AppState::Running(app));
+                                                } else {
+                                                    *error_msg = Some("Failed to write to key.json".to_string());
+                                                }
+                                            }
+                                            Err(_) => *error_msg = Some("Failed to create key.json".to_string())
+                                        }
+                                    }
+                                    Err(_) => *error_msg = Some("Serialization error".to_string()),
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+
+            // --- MAIN APP ---
+            AppState::Running(app) => {
+                egui::TopBottomPanel::top("launcher_header").show(ctx, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Logout").clicked() {
+                            // DISABLE BROWSER
+                            if let Ok(mut guard) = self.is_logged_in.write() {
+                                *guard = false;
+                            }
+                            
+                            next_state = Some(AppState::Login {
+                                input_key: String::new(),
+                                error_msg: None,
+                            });
+                        }
+                    });
+                });
+                app.update(ctx, frame);
+            }
+        }
+
+        if let Some(ns) = next_state {
+            self.state = ns;
+            ctx.request_repaint();
+        }
+    }
+}
+// ==============================================================================
+// 3. MAIN APP IMPLEMENTATION
+// ==============================================================================
 
 pub struct MyApp {
     pub pool: Arc<Mutex<Pool>>,
@@ -625,11 +842,13 @@ impl eframe::App for MyApp {
     }
 }
 
+// ==============================================================================
+// 4. HELPERS
+// ==============================================================================
+
 fn open_token(curve: &Pubkey) {
     let _ = open::that(&format!("https://axiom.trade/meme/{}", curve));
 }
-
-use solana_sdk::pubkey;
 
 pub const PUMP_FUN: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 

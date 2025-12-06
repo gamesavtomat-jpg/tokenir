@@ -27,12 +27,55 @@ use crate::{
     },
 };
 
+use std::ops::{Deref, DerefMut};
+
+#[derive(Debug)]
+pub struct CloneableKeypair(pub Keypair);
+
+impl Clone for CloneableKeypair {
+    fn clone(&self) -> Self {
+        // 1. Get the bytes from the current keypair
+        let bytes = self.0.to_bytes();
+        // 2. Reconstruct a new Keypair from those bytes
+        // unwrapping is safe here because we know the bytes came from a valid Keypair
+        let new_keypair = Keypair::from_bytes(&bytes).expect("Failed to recover keypair from bytes");
+        
+        CloneableKeypair(new_keypair)
+    }
+}
+
+// Allow treating CloneableKeypair just like a Keypair (e.g. calling .pubkey())
+impl Deref for CloneableKeypair {
+    type Target = Keypair;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Allow mutable access if needed
+impl DerefMut for CloneableKeypair {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// Helper to convert easily
+impl From<Keypair> for CloneableKeypair {
+    fn from(kp: Keypair) -> Self {
+        CloneableKeypair(kp)
+    }
+}
+
+// --- Your Updated Struct ---
+
+#[derive(Clone)]
 pub struct AutoBuyConfig {
-    pub wallet: Keypair,
+    pub wallet: CloneableKeypair, // Use the wrapper here
     pub params: Params,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Params {
     pub lamport_amount: u64,
     pub priority_fee: u64,
@@ -189,7 +232,7 @@ impl AutoBuyConfig {
                 });
 
                 let config = AutoBuyConfig {
-                    wallet: Keypair::from_base58_string(&env::var("WALLET").unwrap()),
+                    wallet: Keypair::from_base58_string(&env::var("WALLET").unwrap()).into(),
 
                     params,
                 };
@@ -201,7 +244,7 @@ impl AutoBuyConfig {
 
             Err(_) => {
                 let blacklist = AutoBuyConfig {
-                    wallet: Keypair::from_base58_string(&env::var("WALLET").unwrap()),
+                    wallet: Keypair::from_base58_string(&env::var("WALLET").unwrap()).into(),
 
                     params: Params {
                         lamport_amount: 100,
