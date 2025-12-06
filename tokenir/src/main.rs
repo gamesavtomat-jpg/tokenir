@@ -1,74 +1,96 @@
-// main.rs
-
-// --- NEW DEPENDENCIES ---
 use axum::{
-    Router,
-    extract::{
-        State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
+    extract::{State, ws::{Message, WebSocket, WebSocketUpgrade}, Query}, // Added Query
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
+    Router,
+    Json,
+    http::StatusCode,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::{
-    collections::HashMap,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use tokio::sync::{Mutex, Semaphore, broadcast};
 use tower_http::cors::{Any, CorsLayer};
-use uuid::Uuid;
-// --- END NEW DEPENDENCIES ---
-
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey};
 use std::env;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+// Ensure you import the types needed for the DB actions
+use tokenir::access::{AddUserPayload, User}; 
 use tokenir::constans::helper::{
     bounding_curve, fetch_solana_price, get_community_by_id, get_metadata, get_uri, metadata,
-    parse_community_id,
+    parse_community_id, pool_pda
 };
 use tokenir::database::{Database, DbToken};
 use tokenir::filters::FilterSet;
-use tokenir::{Client, Token, TokenPool}; // Make sure Token is public and imported
-use tokenir::{DevPerformance, bundler::Bundler, constans::helper::pool_pda};
-use tokio::sync::{Mutex, RwLock, Semaphore};
-
+use tokenir::{Client, Token, TokenPool};
+use tokenir::{DevPerformance, bundler::Bundler};
 use tokenir::constans::requests::get_user_created_coins;
 use tokenir::logs::{BuyEvent, CreateEvent, Event};
 
-// --- NEW: WebSocket Shared State ---
-// This struct holds the state of our WebSocket server, specifically
-// a map of connected clients. Each client gets a unique ID and a
-// sender channel to push messages to them.
-#[derive(Default)]
 struct AppState {
-    clients: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
+    tx: broadcast::Sender<String>,
+    db: Arc<Database>,
 }
 
-// a type alias for our shared state, wrapped in Arc<RwLock<>> for
-// concurrent reads (broadcast) without blocking.
-type SharedState = Arc<RwLock<AppState>>;
-// --- END NEW ---
+type SharedState = Arc<AppState>;
+
+#[derive(Deserialize)]
+struct AddUserReq {
+    admin_key: String,
+    payload: AddUserPayload,
+}
+
+#[derive(Deserialize)]
+struct RemoveUserReq {
+    admin_key: String,
+    user_id: i32,
+}
+
+#[derive(Deserialize)]
+struct GetUsersReq {
+    admin_key: String,
+}
+
+// --- NEW: Auth Struct for WebSocket ---
+#[derive(Deserialize)]
+struct WsAuth {
+    key: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
+
+    // 1. Initialize Broadcast Channel
+    let (tx, _rx) = broadcast::channel(100);
+    
+    // Database initialization
+    let database = Arc::new(Database::new(std::env::var("SQL").unwrap()).await.unwrap());
+    let _ = database.initialize_tables().await.unwrap();
+
+    // 2. Initialize Shared State
+    let shared_state = Arc::new(AppState { 
+        tx,
+        db: database.clone() 
+    });
+
     let token_amount = Arc::new(AtomicI64::new(0));
     let sol_price = Arc::new(AtomicU64::new(180));
     let pool = Arc::new(Mutex::new(TokenPool::new()));
+
     let url = env::var("RPC_SOCKET")?;
     let twitter_key = Arc::new(env::var("TWITTER").unwrap());
+
     let solana = Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(
         std::env::var("RPC_HTTP").unwrap(),
     ));
-    let database = Arc::new(Database::new(std::env::var("SQL").unwrap()).await.unwrap());
-    let _ = database.initialize_tables().await.unwrap();
-    let shared_state = Arc::new(RwLock::new(AppState::default()));
 
     // background price/count updater
     tokio::spawn({
@@ -90,12 +112,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Duration, Event)>(1000);
+    let (tx_event, mut rx_event) = tokio::sync::mpsc::channel::<(Duration, Event)>(1000);
     let semaphore = Arc::new(Semaphore::new(20));
 
-    // wss listener
+    // wss listener (Solana)
     tokio::spawn({
-        let event_sender = tx.clone();
+        let event_sender = tx_event.clone();
         async move {
             println!("[Producer] starting wss listener...");
             let client = Client::new(url);
@@ -125,35 +147,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         async move {
             const BATCH_SIZE: usize = 5;
-            while let Some(time_event) = rx.recv().await {
+            while let Some(time_event) = rx_event.recv().await {
                 let mut batch = Vec::with_capacity(BATCH_SIZE);
                 batch.push(time_event);
                 for _ in 1..BATCH_SIZE {
-                    if let Ok(event) = rx.try_recv() {
+                    if let Ok(event) = rx_event.try_recv() {
                         batch.push(event);
                     } else {
                         break;
                     }
                 }
-
-                // pass clones (cheap Arcs) into processor
-                let solana_task = solana_clone.clone();
-                let pool_task = pool_clone.clone();
-                let db_task = db_clone.clone();
-                let twitter_key_task = twitter_key_clone.clone();
-                let sol_price_task = sol_price_clone.clone();
-                let semaphore_task = semaphore_clone.clone();
-                let state_task = state_clone.clone();
-
                 process_event_batch(
                     batch,
-                    solana_task,
-                    pool_task,
-                    db_task,
-                    twitter_key_task,
-                    sol_price_task,
-                    semaphore_task,
-                    state_task,
+                    solana_clone.clone(),
+                    pool_clone.clone(),
+                    db_clone.clone(),
+                    twitter_key_clone.clone(),
+                    sol_price_clone.clone(),
+                    semaphore_clone.clone(),
+                    state_clone.clone(),
                 )
                 .await;
             }
@@ -161,9 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // run websocket server in foreground
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/admin/add_user", post(add_user_handler))
+        .route("/admin/remove_user", post(remove_user_handler))
+        .route("/admin/users", post(get_users_handler))
         .with_state(shared_state)
         .layer(
             CorsLayer::new()
@@ -175,7 +189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
     println!("[websocket server] listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
@@ -183,7 +196,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// process_event_batch accepts SharedState (Arc<RwLock<AppState>>)
+async fn add_user_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<AddUserReq>,
+) -> impl IntoResponse {
+    match state.db.add_user(&req.admin_key, req.payload).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "success"}))),
+        Err(sqlx::Error::RowNotFound) => (
+            StatusCode::FORBIDDEN, 
+            Json(serde_json::json!({"error": "Invalid admin key or unauthorized"}))
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR, 
+            Json(serde_json::json!({"error": e.to_string()}))
+        ),
+    }
+}
+
+async fn remove_user_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<RemoveUserReq>,
+) -> impl IntoResponse {
+    match state.db.remove_user(&req.admin_key, req.user_id).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "removed"}))),
+        Err(sqlx::Error::RowNotFound) => (
+            StatusCode::FORBIDDEN, 
+            Json(serde_json::json!({"error": "Invalid admin key or target not found/admin"}))
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR, 
+            Json(serde_json::json!({"error": e.to_string()}))
+        ),
+    }
+}
+
+async fn get_users_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<GetUsersReq>,
+) -> impl IntoResponse {
+    match state.db.fetch_all_users(&req.admin_key).await {
+        Ok(users) => (StatusCode::OK, Json(serde_json::to_value(users).unwrap())),
+        Err(sqlx::Error::RowNotFound) => (
+            StatusCode::FORBIDDEN, 
+            Json(serde_json::json!({"error": "Invalid admin key"}))
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR, 
+            Json(serde_json::json!({"error": e.to_string()}))
+        ),
+    }
+}
+
 async fn process_event_batch(
     batch: Vec<(Duration, Event)>,
     solana: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
@@ -219,7 +282,6 @@ async fn process_event_batch(
                 });
             }
             Event::Buy(data) => {
-                // spawn buy tasks so consumer loop isn't blocked by DB work
                 let pool_task2 = pool_task.clone();
                 let db_task2 = db_task.clone();
                 let price = sol_price_task.load(Ordering::Relaxed);
@@ -246,14 +308,14 @@ async fn process_create_event(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 
-    // если событие старше 5 секунд — не пушим
     if now.saturating_sub(time) > Duration::from_secs(5) {
         println!("[skip] token is too old, not broadcasting");
         return;
     }
-    println!("mint: {}", data.mint);
-    let clone_data = data.clone();
 
+    println!("mint: {}", data.mint);
+
+    let clone_data = data.clone();
     let metadata = match get_metadata(&clone_data.uri).await {
         Ok(data) => data,
         Err(err) => {
@@ -324,7 +386,6 @@ async fn process_create_event(
                 "[broadcaster] new normal token found: {}. sending to subscribers.",
                 token.mint
             );
-
             return;
         }
     };
@@ -338,18 +399,17 @@ async fn process_create_event(
     pool.add(data, Some(cloned_community));
 
     let pda = pool_pda(&mint).0;
+
     if let Some(mut token) = pool.pool().get(&pda).cloned() {
         if let Some((average_mcap, last_tokens, count)) = average_dev_mcap(&database, &id).await {
             pool.filtered.push(mint.clone());
-
             token.dev_performance = Some(DevPerformance {
                 average_ath: average_mcap,
                 last_tokens,
                 count,
             });
-
-            // broadcast filtered token (again) — also done with minimal locking
         }
+        drop(pool);
 
         println!(
             "[broadcaster] new filtered token found: {}. sending to subscribers.",
@@ -358,9 +418,7 @@ async fn process_create_event(
         broadcast_token(token.clone(), state.clone()).await;
 
         let token_clone = token.clone();
-
         drop(token);
-        drop(pool);
 
         let _ = database.add_dev(creator.id.clone()).await;
         let _ = database
@@ -369,99 +427,88 @@ async fn process_create_event(
     }
 }
 
-/// main handler for websocket connections.
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
-}
-
-/// manages an individual client's websocket connection.
-async fn handle_socket(socket: WebSocket, state: SharedState) {
-    let client_id = Uuid::new_v4();
-    println!("[websocket] new client connected: {}", client_id);
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    // add the client's sender to our shared state (write lock)
-    {
-        let mut w = state.write().await;
-        w.clients.insert(client_id, tx);
+// --- MODIFIED: WebSocket Handler with Authentication ---
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(auth): Query<WsAuth>, // Extract ?key=... from URL
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    // 1. Check Key Length
+    if auth.key.len() != 32 {
+        println!("[websocket] connection denied: key length != 32");
+        return (StatusCode::BAD_REQUEST, "Invalid Key Length").into_response();
     }
 
+    // 2. Validate Key against Database
+    match state.db.validate_user_key(&auth.key).await {
+        Ok(true) => {
+            // Authorized
+            ws.on_upgrade(|socket| handle_socket(socket, state))
+        },
+        Ok(false) => {
+            // Key not found
+            println!("[websocket] connection denied: key not found in db");
+            (StatusCode::FORBIDDEN, "Unauthorized: Invalid Key").into_response()
+        },
+        Err(e) => {
+            // DB Error
+            eprintln!("[websocket] db error during auth: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+        }
+    }
+}
+
+async fn handle_socket(socket: WebSocket, state: SharedState) {
+    println!("[websocket] new client connected");
+    let mut rx = state.tx.subscribe();
     let (mut sink, mut stream) = socket.split();
 
-    // task to send messages to the client (reads from rx)
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+    let mut send_task = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    if sink.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(amount)) => {
+                    println!("[websocket] client lagged by {} msgs - skipping forward", amount);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
             }
         }
     });
 
-    // task to receive messages from client (we ignore content for now)
-    let recv_task = tokio::spawn(async move {
-        while let Some(Ok(_msg)) = stream.next().await {
-            // future: handle client messages if needed
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(_)) = stream.next().await {
         }
     });
 
     tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     }
-
-    // cleanup: remove client (write lock)
-    {
-        let mut w = state.write().await;
-        w.clients.remove(&client_id);
-    }
-    println!("[websocket] client disconnected: {}", client_id);
+    println!("[websocket] client disconnected");
 }
 
-/// serializes a token and broadcasts it to all connected clients.
-/// optimized: take snapshot of senders under read-lock, drop lock, send.
-/// if some sends fail - remove failed clients under write-lock.
 async fn broadcast_token<T: Serialize + Clone>(data: T, state: SharedState) {
     let msg = match serde_json::to_string(&data) {
-        Ok(json) => Message::Text(json),
+        Ok(json) => json,
         Err(e) => {
             eprintln!("[broadcaster] failed to serialize token: {}", e);
             return;
         }
     };
-
-    // take a snapshot of (id, sender) under read lock
-    let clients_snapshot: Vec<(Uuid, mpsc::UnboundedSender<Message>)> = {
-        let r = state.read().await;
-        r.clients.iter().map(|(id, tx)| (*id, tx.clone())).collect()
-    };
-
-    if clients_snapshot.is_empty() {
-        return;
-    }
-
-    // send without holding the lock
-    let mut failed = Vec::new();
-    for (id, tx) in clients_snapshot {
-        if tx.send(msg.clone()).is_err() {
-            failed.push(id);
-        }
-    }
-
-    // remove failed clients if any under write lock
-    if !failed.is_empty() {
-        let mut w = state.write().await;
-        for id in failed {
-            w.clients.remove(&id);
-        }
-    }
+    let _ = state.tx.send(msg);
 }
 
 async fn buy(data: BuyEvent, pool: Arc<Mutex<TokenPool>>, database: Arc<Database>, price: u64) {
     let mint = data.mint.clone();
     let mut ath = 0;
-
     let mut pool = pool.lock().await;
+
     if let Some(token) = pool.pool().get(&mint) {
         ath = token.usd_ath();
     }

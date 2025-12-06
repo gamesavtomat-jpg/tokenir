@@ -74,7 +74,7 @@ impl Token {
         self.ath
     }
 
-    pub fn dbtoken(self, mint: Pubkey) -> DbToken {
+    pub fn dbtoken(&self, mint: Pubkey) -> DbToken {
         DbToken {
             mint: mint.to_string(),
             dev_address: self.dev.to_string(),

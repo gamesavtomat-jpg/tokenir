@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use sqlx::{PgPool, Pool, Postgres, Transaction, postgres::PgPoolOptions, prelude::FromRow};
 
-use crate::Token;
+use crate::{Token, access::{AddUserPayload, User}};
 pub struct Database {
     connection_url: String,
     pool: Pool<Postgres>,
@@ -19,6 +19,128 @@ impl Database {
             connection_url: url,
         })
     }
+
+    // --- NEW: Validate Key ---
+    pub async fn validate_user_key(&self, key: &str) -> Result<bool, sqlx::Error> {
+        let pool = self.connection();
+        
+        // Check if access_key exists
+        let result: Option<(i32,)> = sqlx::query_as(
+            "SELECT id FROM users WHERE access_key = $1"
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(result.is_some())
+    }
+    // -------------------------
+
+    pub async fn add_user(
+        &self,
+        caller_admin_key: &str,
+        payload: AddUserPayload,
+    ) -> Result<(), sqlx::Error> {
+        let pool = self.connection();
+
+        // check if caller is admin
+        let is_admin: (bool,) = sqlx::query_as(
+            "SELECT admin FROM users WHERE access_key = $1"
+        )
+        .bind(caller_admin_key)
+        .fetch_one(pool)
+        .await?;
+
+        if payload.provided_key.len() != 32 {
+            return Err(sqlx::Error::Protocol("Key must be exactly 32 characters".into()));
+        }
+
+        if !is_admin.0 {
+            return Err(sqlx::Error::RowNotFound); // not admin
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (access_key, hint, admin)
+            VALUES ($1, $2, false)
+            "#,
+        )
+        .bind(payload.provided_key)
+        .bind(payload.hint)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn remove_user(
+        &self,
+        caller_admin_key: &str,
+        user_id: i32,
+    ) -> Result<(), sqlx::Error> {
+        let pool = self.connection();
+
+        // check if caller is admin
+        let is_admin: (bool,) = sqlx::query_as(
+            "SELECT admin FROM users WHERE access_key = $1"
+        )
+        .bind(caller_admin_key)
+        .fetch_one(pool)
+        .await?;
+
+        if !is_admin.0 {
+            return Err(sqlx::Error::RowNotFound); // not admin
+        }
+
+        // check if target user is admin
+        let target_admin: (bool,) = sqlx::query_as(
+            "SELECT admin FROM users WHERE id = $1"
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+
+        if target_admin.0 {
+            return Err(sqlx::Error::RowNotFound); // can't delete admin
+        }
+
+        sqlx::query(
+            "DELETE FROM users WHERE id = $1"
+        )
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn fetch_all_users(
+        &self,
+        caller_admin_key: &str,
+    ) -> Result<Vec<User>, sqlx::Error> {
+        let pool = self.connection();
+
+        // check if caller is admin
+        let is_admin: (bool,) = sqlx::query_as(
+            "SELECT admin FROM users WHERE access_key = $1"
+        )
+        .bind(caller_admin_key)
+        .fetch_one(pool)
+        .await?;
+
+        if !is_admin.0 {
+            return Err(sqlx::Error::RowNotFound); // not admin
+        }
+
+        let users = sqlx::query_as::<_, User>(
+            "SELECT id, access_key, hint, admin FROM users"
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(users)
+    }
+
 
     pub async fn initialize_tables(&self) -> Result<(), sqlx::Error> {
         let pool = self.connection();
@@ -44,6 +166,30 @@ impl Database {
                 created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
                 CONSTRAINT fk_dev FOREIGN KEY (dev_address) REFERENCES devs(dev_address)
             );
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                access_key CHAR(32) UNIQUE,
+                hint TEXT,
+                admin BOOLEAN DEFAULT false
+            );
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        
+        sqlx::query(
+            r#"
+                INSERT INTO users (access_key, hint, admin)
+                VALUES ('af3soy8thnhi06tsqc38talrs4a227ma', 'Админ', true)
+                ON CONFLICT (access_key) DO NOTHING;
             "#,
         )
         .execute(pool)
@@ -89,7 +235,7 @@ impl Database {
         )
         .bind(&mint.to_string())
         .bind(twitter)
-        .bind(token.ath) // Assuming ath in the database is BIGINT
+        .bind(token.ath) 
         .execute(pool)
         .await?;
 
@@ -102,10 +248,11 @@ impl Database {
         token: &DbToken,
     ) -> Result<(), sqlx::Error> {
         let pool = self.connection();
+        
         sqlx::query(
             r#"
             UPDATE tokens
-            SET ath = $2
+            SET ath = GREATEST(ath, $2)
             WHERE mint = $1
             "#,
         )
@@ -113,6 +260,7 @@ impl Database {
         .bind(token.ath)
         .execute(pool)
         .await?;
+        
         Ok(())
     }
 
