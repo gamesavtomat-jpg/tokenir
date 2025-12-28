@@ -3,8 +3,9 @@ use sqlx::prelude::FromRow;
 
 #[derive(Deserialize)]
 pub struct AddUserPayload {
-    pub provided_key : String,
-    pub hint : String
+    pub provided_key: String,
+    pub hint: String,
+    pub autobuy : bool
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -13,5 +14,5 @@ pub struct User {
     pub access_key: String,
     pub hint: String,
     pub admin: bool,
+    pub autobuy: bool
 }
-

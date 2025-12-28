@@ -1,4 +1,5 @@
-use borsh::BorshDeserialize;
+use borsh::{BorshDeserialize, io};
+use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 
 #[derive(Debug)]
@@ -18,7 +19,7 @@ impl Event {
     }
 }
 
-#[derive(Clone, Debug, BorshDeserialize)]
+#[derive(Clone, Debug)]
 pub struct CreateEvent {
     pub name: String,
     pub symbol: String,
@@ -26,6 +27,33 @@ pub struct CreateEvent {
     pub mint: Pubkey,
     pub bonding_curve: Pubkey,
     pub user: Pubkey,
+    pub token_2022: bool,
+}
+
+impl BorshDeserialize for CreateEvent {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let name = String::deserialize_reader(reader)?;
+        let symbol = String::deserialize_reader(reader)?;
+        let uri = String::deserialize_reader(reader)?;
+        let mint = Pubkey::deserialize_reader(reader)?;
+        let bonding_curve = Pubkey::deserialize_reader(reader)?;
+        let user = Pubkey::deserialize_reader(reader)?;
+
+        let token_2022 = match bool::deserialize_reader(reader) {
+            Ok(v) => v,
+            Err(_) => false,
+        };
+
+        Ok(Self {
+            name,
+            symbol,
+            uri,
+            mint,
+            bonding_curve,
+            user,
+            token_2022,
+        })
+    }
 }
 
 #[derive(Clone, Debug, BorshDeserialize)]
@@ -55,6 +83,7 @@ impl From<CreateEventV2> for CreateEvent {
             mint: v.mint,
             bonding_curve: v.bonding_curve,
             user: v.user,
+            token_2022: v.token_program == pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
         }
     }
 }

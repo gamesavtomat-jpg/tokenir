@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 
 use crate::constans::helper::pool_pda;
+use crate::requests::Metadata;
 use crate::{
     DevPerformance, Token, Trade,
     constans::{helper::CommunityInfo, requests::get_user_created_coins},
@@ -40,8 +41,17 @@ impl TokenPool {
             max_size: 50,
         }
     }
+    // Inside TokenPool implementation
+    pub fn get_token_mut(&mut self, pda: &Pubkey) -> Option<&mut Token> {
+        self.pool.get_mut(pda)
+    }
 
-    pub fn add(&mut self, event: CreateEvent, community: Option<CommunityInfo>) {
+    pub fn add(
+        &mut self,
+        event: CreateEvent,
+        metadata: Option<Metadata>,
+        community: Option<CommunityInfo>,
+    ) {
         let token = Token::fresh(
             event.name,
             event.symbol,
@@ -49,6 +59,9 @@ impl TokenPool {
             event.bonding_curve,
             community,
             event.mint,
+            event.token_2022,
+            Some(event.uri),
+            metadata,
         );
 
         let pda = pool_pda(&event.mint.clone()).0;
@@ -61,6 +74,11 @@ impl TokenPool {
                 self.pool.remove(front);
             }
         }
+    }
+
+    pub fn remove(&mut self, mint: &Pubkey) {
+        let pda = pool_pda(mint).0;
+        self.pool.remove(&pda);
     }
 
     pub fn clear_migrated(&mut self) {

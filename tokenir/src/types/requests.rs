@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct LogsNotification {
@@ -81,11 +81,12 @@ impl TokenInfo {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub name: String,
     pub symbol: String,
-    pub description: String,
+    pub description: Option<String>,
     pub twitter: Option<String>,
     pub website: Option<String>,
+    pub image: Option<String>,
 }

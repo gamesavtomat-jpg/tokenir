@@ -31,16 +31,12 @@ impl Bundler {
     }
 
     pub async fn send(&mut self, database: &Database) -> Result<(), sqlx::Error> {
-        if self.data.is_empty() {
-            return Ok(());
-        }
+        // if self.data.is_empty() {
+        //     return Ok(());
+        // }
 
-        for (mint, token) in &self.data {
-            let _ = database.update_token_ath(mint, token).await.unwrap();
-        }
-
-        self.data.clear();
-        self.current = 0;
+        // self.data.clear();
+        // self.current = 0;
 
         Ok(())
     }
