@@ -1,23 +1,18 @@
 #![windows_subsystem = "windows"]
 
 use std::{
-    env, io::Read, sync::{
-        Arc,
+    env, str::FromStr, sync::{
+        Arc, RwLock,
         atomic::{AtomicI64, AtomicU64, Ordering},
-        RwLock, // Using std::sync::RwLock for sharing between threads
     }
 };
 
-use solana_sdk::{pubkey, signature::Keypair};
-use tokenir_ui::migration::get_user_created_coins;
+use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use tokenir_ui::{Creator, Token, migration::get_user_created_coins};
 use tokio::sync::Mutex;
 
 use crate::{
-    autobuy::{AutoBuyConfig, BuyAutomata, Params},
-    blacklist::Blacklist,
-    fetcher::Client,
-    filter::FilterSet,
-    pool::Pool, ui::KeyConfig,
+    autobuy::{AutoBuyConfig, BuyAutomata}, blacklist::Blacklist, fetcher::Client, pool::Pool, ui::TradeTerminal, whitelist::{Allowable, Whitelist}
 };
 
 mod autobuy;
@@ -27,18 +22,18 @@ mod filter;
 mod pool;
 mod pump_interaction;
 mod ui;
+mod whitelist;
 
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
 
-    // 1. Initialize objects that don't depend on the key
     let solana_client = Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(
         env::var("SOLANA_RPC").unwrap(),
     ));
 
     let blacklist = Arc::new(Mutex::new(Blacklist::load()));
-
+    let whitelist = Arc::new(Mutex::new(Whitelist::load()));
     let automata = Arc::new(Mutex::new(BuyAutomata::with_config(
         solana_client.clone(),
         AutoBuyConfig::load(),
@@ -48,190 +43,56 @@ async fn main() {
     let price = Arc::new(AtomicU64::new(180));
     let total = Arc::new(AtomicI64::new(0));
     
-    // Global state for browser opening permission
     let is_logged_in = Arc::new(RwLock::new(false));
+    let trade_terminal = Arc::new(RwLock::new(ui::TradeTerminal::load_from_file("./terminal.json").unwrap_or(ui::TradeTerminal::Axiom)));
 
-    // 2. Clone Arcs to be moved into the connection task
-    let task_pool = pool.clone();
-    let task_total = total.clone();
-    let task_automata = automata.clone();
-    let task_blacklist = blacklist.clone();
-    let task_solana = solana_client.clone(); // Kept if needed later
-    
-    // Clone login state for the background task
-    let task_login_state = is_logged_in.clone();
-
-    // 4. Spawn the background task that WAITS for the key before connecting
     let (tx, mut rx) = tokio::sync::watch::channel(String::new());
 
-tokio::spawn(async move {
-    let mut current_handle: Option<tokio::task::JoinHandle<()>> = None;
+    tokio::spawn({
+        let pool = pool.clone();
+        let total = total.clone();
+        let blacklist = blacklist.clone();
+        let automata = automata.clone();
+        let login_state = is_logged_in.clone();
+        let trade_terminal = trade_terminal.clone();
 
-    loop {
-        // ждём нового ключа
-        rx.changed().await.unwrap();
-        let access_key = rx.borrow().clone();
+        async move {
+            let mut current: Option<tokio::task::JoinHandle<()>> = None;
 
-        if access_key.is_empty() {
-            continue;
-        }
+            loop {
+                rx.changed().await.unwrap();
+                let key = rx.borrow().clone();
+                if key.is_empty() {
+                    continue;
+                }
 
-        println!("Key received/updated, starting connection...");
+                if let Some(h) = current.take() {
+                    h.abort();
+                }
 
-        // отменяем предыдущий клиент, если есть
-        if let Some(handle) = current_handle.take() {
-            handle.abort();
-            println!("Previous connection aborted");
-        }
+                let base = env::var("SERVER").expect("SERVER missing");
+                let client = Client::new(format!("{}?key={}", base, key));
 
-        let base_url = std::env::var("SERVER").expect("SERVER env var must be set");
-        let url = format!("{}?key={}", base_url, access_key);
+                current = Some(tokio::spawn(run_subscription(
+                    client,
+                    pool.clone(),
+                    total.clone(),
+                    blacklist.clone(),
+                    whitelist.clone(),
+                    automata.clone(),
+                    login_state.clone(),
+                    trade_terminal.clone(),
+                )));
 
-        let client = Client::new(url);
-
-        // создаём новую таску для subscription
-        let handle = tokio::spawn({
-            let task_total = task_total.clone();
-            let task_pool = task_pool.clone();
-            let task_blacklist = task_blacklist.clone();
-            let task_automata = task_automata.clone();
-            let task_login_state = task_login_state.clone();
-
-            async move {
-                let _ = client
-                    .subscribe(|mut token| {
-                        let total = task_total.clone();
-                        let pool = task_pool.clone();
-                        let blacklist = task_blacklist.clone();
-                        let automata = task_automata.clone();
-                        let login_state = task_login_state.clone();
-
-                        async move {
-                            if !*login_state.read().unwrap() {
-                                return;
-                            }
-
-                            let migration = get_user_created_coins(&token.dev).await.ok();
-                            token.migrated = migration;
-
-                            let mut token_clone = token.clone();
-
-                            if let Some(performance) = &token.dev_performance {
-                                let lock = pool.lock().await;
-
-                                if lock.filters.matches(&token, Some(performance.average_ath)) {
-                                    let blacklist = blacklist.lock().await;
-                                    drop(lock);
-
-                                    if let Some(twitter) = &token.twitter {
-                                        if !blacklist.present(&blacklist::Bannable::Twitter(
-                                            twitter.creator.id.clone(),
-                                        )) {
-                                            drop(blacklist);
-                                            let average_ath = performance.average_ath;
-                                            let curve = token.curve.clone();
-
-                                            tokio::spawn(async move {
-                                                let _ = token.load_history().await;
-                                                let mut lock = pool.lock().await;
-                                                lock.add(token);
-                                            });
-
-                                            if automata
-                                                .lock()
-                                                .await
-                                                .config
-                                                .params
-                                                .filters
-                                                .matches(&token_clone, Some(average_ath))
-                                            {
-                                                let automata = automata.lock().await;
-
-                                                if automata.active_twitter {
-                                                    let _ = automata.buy(&token_clone).await;
-                                                    println!("bought!");
-                                                }
-                                            }
-
-                                            total.fetch_add(1, Ordering::Relaxed);
-
-                                            if *login_state.read().unwrap() {
-                                                let _ = open::that(format!(
-                                                    "https://axiom.trade/meme/{}",
-                                                    curve.to_string()
-                                                ));
-                                            }
-                                        }
-                                    }
-
-                                    return;
-                                }
-                            } else if let Some(_migrated) = &token_clone.migrated {
-                                let lock = pool.lock().await;
-
-                                if lock.filters.matches(&token_clone, None) {
-                                    let blacklist = blacklist.lock().await;
-                                    drop(lock);
-
-                                    if !blacklist.present(&blacklist::Bannable::Wallet(token.dev)) {
-                                        let curve = token_clone.curve.clone();
-                                        let mut lock = pool.lock().await;
-
-                                        if automata
-                                            .lock()
-                                            .await
-                                            .config
-                                            .params
-                                            .filters
-                                            .matches(&token_clone, None)
-                                        {
-                                            let automata = automata.lock().await;
-
-                                            if automata.active_migrate {
-                                                let _ = automata.buy(&token_clone).await;
-                                                println!("bought migrated!");
-                                            }
-                                        }
-
-                                        if !lock.feed_check.contains(&token_clone.mint) {
-                                            lock.add(token_clone);
-                                        }
-
-                                        drop(lock);
-                                        total.fetch_add(1, Ordering::Relaxed);
-
-                                        let url = format!("https://axiom.trade/meme/{}", curve);
-                                        let thread_login_state = login_state.clone();
-                                        std::thread::spawn(move || {
-                                            if *thread_login_state.read().unwrap() {
-                                                let _ = open::that(url);
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    .await;
             }
-        });
+        }
+    });
 
-        current_handle = Some(handle);
-    }
-});
-
-
-
-    // 5. Setup UI
     const ICON: &[u8; 9946] = include_bytes!("../logo.png");
 
     let mut options = eframe::NativeOptions::default();
-    options.viewport.icon = Some(Arc::new(eframe::icon_data::from_png_bytes(ICON)
-        .expect("The icon data must be valid")));
-    
-    // 6. Launch App, passing the sender 'tx' and the login state
-    let close_automata = automata.clone();
-    
+    options.viewport.icon = Some(Arc::new(eframe::icon_data::from_png_bytes(ICON).unwrap()));
+
     let app = ui::Launcher::new(
         pool.clone(),
         blacklist.clone(),
@@ -240,10 +101,246 @@ tokio::spawn(async move {
         automata.clone(),
         Some(AutoBuyConfig::load()),
         tx,
-        is_logged_in, // Pass the lock here
+        is_logged_in.clone(),
+        trade_terminal.clone()
     );
 
     eframe::run_native("MemeX", options, Box::new(|_| Ok(Box::new(app))));
+    automata.lock().await.config.to_file();
+}
 
-    close_automata.lock().await.config.to_file();
+async fn run_subscription(
+    client: Client,
+    pool: Arc<Mutex<Pool>>,
+    total: Arc<AtomicI64>,
+    blacklist: Arc<Mutex<Blacklist>>,
+    whitelist: Arc<Mutex<Whitelist>>,
+    automata: Arc<Mutex<BuyAutomata>>,
+    login_state: Arc<RwLock<bool>>,
+    trade_terminal : Arc<RwLock<TradeTerminal>>
+) {
+    let _ = client
+        .subscribe(|mut token, autobuy| {
+            let pool = pool.clone();
+            let total = total.clone();
+            let blacklist = blacklist.clone();
+            let whitelist = whitelist.clone();
+            let automata = automata.clone();
+            let login_state = login_state.clone();
+            let trade_terminal = trade_terminal.clone();
+            
+            async move {
+                {
+                    automata.lock().await.enabled = autobuy;
+                }
+                
+                if !*login_state.read().unwrap() {
+                    return;
+                }
+
+                token.migrated = get_user_created_coins(&token.dev).await.ok();
+                let token_clone = token.clone();
+
+                let whitelist_bought = {
+                    let whitelist_data = Whitelist::load();
+
+                    let lock = automata.lock().await;
+                    let whitelist_buy = lock.active_whitelist;
+                    drop(lock);
+
+                    if whitelist_buy {
+                        let whitelisted = is_whitelisted(&whitelist_data, &token).await;
+
+                        if whitelisted {
+                            let curve = token.curve.clone();
+                            let login_state = login_state.clone();
+                            let trade_terminal = trade_terminal.clone();
+
+                            std::thread::spawn(move || {
+                                if *login_state.read().unwrap() {
+                                    let terminal = *trade_terminal.read().unwrap();
+                                    let _ = open::that(terminal.url(&curve));
+                                }
+                            });
+
+                            tokio::spawn({
+                                let pool = pool.clone();
+                                let mut token = token.clone();
+                                async move {
+                                    let _ = token.load_history().await;
+                                    pool.lock().await.add(token);
+                                }
+                            });
+
+                            let automata = automata.lock().await;
+                            let _ = automata.buy(&token_clone).await;
+                            true // <- just this, no `return`
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if whitelist_bought {
+                    return;
+                }
+
+                // === NORMAL FLOW ===
+                if let Some(perf) = &token.dev_performance {
+                    handle_perf(
+                        token.clone(),
+                        perf.average_ath,
+                        pool,
+                        total,
+                        blacklist,
+                        automata,
+                        login_state,
+                        trade_terminal.clone()
+                    )
+                    .await;
+                } else if token_clone.migrated.is_some() {
+                    handle_migrated(token_clone, pool, total, blacklist, automata, login_state, trade_terminal.clone())
+                        .await;
+                }
+            }
+        })
+        .await;
+}
+
+async fn handle_perf(
+    token: Token,
+    avg_ath: u64,
+    pool: Arc<Mutex<Pool>>,
+    total: Arc<AtomicI64>,
+    blacklist: Arc<Mutex<Blacklist>>,
+    automata: Arc<Mutex<BuyAutomata>>,
+    login_state: Arc<RwLock<bool>>,
+    trade_terminal : Arc<RwLock<TradeTerminal>>
+) {
+    let token_clone = token.clone();
+    let lock = pool.lock().await;
+    if !lock.filters.matches(&token, Some(avg_ath)) {
+        return;
+    }
+    drop(lock);
+
+    if let Some(twitter) = &token.twitter {
+        if blacklist
+            .lock()
+            .await
+            .present(&blacklist::Bannable::Twitter(twitter.creator.id.clone()))
+        {
+            return;
+        }
+    }
+
+    let curve = token.curve.clone();
+
+    tokio::spawn({
+        let pool = pool.clone();
+        let mut token = token.clone();
+        async move {
+            let _ = token.load_history().await;
+            pool.lock().await.add(token);
+        }
+    });
+
+    if automata
+        .lock()
+        .await
+        .config
+        .params
+        .filters
+        .matches(&token_clone, Some(avg_ath))
+    {
+        let automata = automata.lock().await;
+        if automata.active_twitter {
+            let _ = automata.buy(&token_clone).await;
+        }
+    }
+
+    total.fetch_add(1, Ordering::Relaxed);
+
+    std::thread::spawn(move || {
+        if *login_state.read().unwrap() {
+            let terminal = *trade_terminal.read().unwrap();
+            let _ = open::that(terminal.url(&curve));
+        }
+    });
+}
+
+async fn handle_migrated(
+    token: Token,
+    pool: Arc<Mutex<Pool>>,
+    total: Arc<AtomicI64>,
+    blacklist: Arc<Mutex<Blacklist>>,
+    automata: Arc<Mutex<BuyAutomata>>,
+    login_state: Arc<RwLock<bool>>,
+    trade_terminal : Arc<RwLock<TradeTerminal>>
+) {
+    let lock = pool.lock().await;
+    if !lock.filters.matches(&token, None) {
+        return;
+    }
+    drop(lock);
+
+    if blacklist
+        .lock()
+        .await
+        .present(&blacklist::Bannable::Wallet(token.dev))
+    {
+        return;
+    }
+
+    if automata
+        .lock()
+        .await
+        .config
+        .params
+        .filters
+        .matches(&token, None)
+    {
+        let automata = automata.lock().await;
+        if automata.active_migrate {
+            let _ = automata.buy(&token).await;
+        }
+    }
+
+    let curve = token.curve.clone();
+    let mut lock = pool.lock().await;
+
+    if !lock.feed_check.contains(&token.mint) {
+        lock.add(token);
+    }
+
+    total.fetch_add(1, Ordering::Relaxed);
+
+    let login_state = login_state.clone();
+    std::thread::spawn(move || {
+        if *login_state.read().unwrap() {
+            let terminal = *trade_terminal.read().unwrap();
+            let _ = open::that(terminal.url(&curve));
+        }
+    });
+}
+
+/// проверка whitelist для токена
+async fn is_whitelisted(whitelist: &Whitelist, token: &Token) -> bool {
+    let wl = whitelist;
+
+    // wallet
+    if wl.present(&Allowable::Wallet(token.dev)) {
+        return true;
+    }
+
+    // twitter screen_name
+    if let Some(twitter) = &token.twitter {
+        if let Some(screen_name) = &twitter.creator.screen_name {
+            return wl.present(&Allowable::Twitter(screen_name.to_string()));
+        }
+    }
+
+    false
 }

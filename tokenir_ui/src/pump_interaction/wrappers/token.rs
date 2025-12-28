@@ -19,9 +19,9 @@ pub struct TokenAccounts {
 }
 
 impl TokenAccounts {
-    pub fn new(mint: &Pubkey, creator: &Pubkey) -> Self {
+    pub fn new(mint: &Pubkey, creator: &Pubkey, token_2022 : bool) -> Self {
         let (bonding_curve, _) = bounding_curve(mint);
-        let (associated_bonding_curve, _) = associated_token_address(&bonding_curve, mint);
+        let (associated_bonding_curve, _) = associated_token_address(&bonding_curve, mint, token_2022);
         let (metadata, _) = metadata(&mint);
 
         let (creator_vault, _) = creator_vault(creator);

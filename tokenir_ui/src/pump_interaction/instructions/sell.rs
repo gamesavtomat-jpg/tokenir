@@ -37,14 +37,19 @@ impl Sell {
     }
 }
 
-pub fn sell(signer: &Keypair, token: &TokenAccounts, instruction: &Sell) -> Instruction {
+pub fn sell(signer: &Keypair, token: &TokenAccounts, instruction: &Sell, token_2022 : bool) -> Instruction {
     let mint = *token.mint();
 
     let bonding_curve = *token.bonding_curve();
     let associated_bonding_curve = *token.associated_bonding_curve();
 
     let (associated_user_account, _) =
-        constans::deriving::associated_token_address(&signer.pubkey(), &mint);
+        constans::deriving::associated_token_address(&signer.pubkey(), &mint, token_2022);
+
+    let token_program = match token_2022 {
+        true => constans::programs::TOKEN_PROGRAM_2022,
+        false => constans::programs::TOKEN_PROGRAM,
+    };
 
     Instruction::new_with_bytes(
         constans::programs::PUMP_FUN,
@@ -59,7 +64,7 @@ pub fn sell(signer: &Keypair, token: &TokenAccounts, instruction: &Sell) -> Inst
             AccountMeta::new(signer.pubkey(), true),
             AccountMeta::new_readonly(constans::programs::SYSTEM_PROGRAM, false),
             AccountMeta::new(*token.creator_vault(), false),
-            AccountMeta::new_readonly(constans::programs::TOKEN_PROGRAM, false),
+            AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(constans::accounts::EVENT_AUTHORITY, false),
             AccountMeta::new_readonly(constans::programs::PUMP_FUN, false),
         ],

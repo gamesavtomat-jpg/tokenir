@@ -8,12 +8,13 @@ use std::{
     io::{Read, Write},
     str::FromStr,
     sync::{
+        Arc,
+        RwLock, // Added RwLock
         atomic::{AtomicI64, AtomicU64},
-        Arc, RwLock, // Added RwLock
     },
 };
 use tokenir_ui::Token;
-use tokio::sync::{watch::Sender, Mutex};
+use tokio::sync::{Mutex, watch::Sender};
 
 use crate::{
     autobuy::{AutoBuyConfig, BuyAutomata},
@@ -43,9 +44,10 @@ pub struct Launcher {
     config: Option<AutoBuyConfig>,
 
     startup_tx: Sender<String>,
-    
+
     // Added permission lock
-    is_logged_in: Arc<RwLock<bool>>, 
+    is_logged_in: Arc<RwLock<bool>>,
+    pub trade_terminal: Arc<RwLock<TradeTerminal>>,
 }
 
 enum AppState {
@@ -65,7 +67,8 @@ impl Launcher {
         automata: Arc<Mutex<BuyAutomata>>,
         config: Option<AutoBuyConfig>,
         startup_tx: Sender<String>,
-        is_logged_in: Arc<RwLock<bool>>, // New argument
+        is_logged_in: Arc<RwLock<bool>>, // New argument,
+        trade_terminal : Arc<RwLock<TradeTerminal>>
     ) -> Self {
         // 1. Try to load key.json
         let loaded_key = if let Ok(mut file) = File::open("key.json") {
@@ -83,7 +86,7 @@ impl Launcher {
         let state = if let Some(k) = loaded_key {
             // Key exists: Signal main thread
             let _ = startup_tx.send(k.access_key.clone());
-            
+
             // ALLOW BROWSER
             if let Ok(mut guard) = is_logged_in.write() {
                 *guard = true;
@@ -96,6 +99,7 @@ impl Launcher {
                 total.clone(),
                 automata.clone(),
                 config.clone(),
+                trade_terminal.clone()
             );
             AppState::Running(app)
         } else {
@@ -103,7 +107,7 @@ impl Launcher {
             if let Ok(mut guard) = is_logged_in.write() {
                 *guard = false;
             }
-            
+
             AppState::Login {
                 input_key: String::new(),
                 error_msg: None,
@@ -120,6 +124,7 @@ impl Launcher {
             config,
             startup_tx,
             is_logged_in,
+            trade_terminal
         }
     }
 }
@@ -176,7 +181,8 @@ impl eframe::App for Launcher {
                                                     let _ = self.startup_tx.send(key_val);
 
                                                     // ENABLE BROWSER
-                                                    if let Ok(mut guard) = self.is_logged_in.write() {
+                                                    if let Ok(mut guard) = self.is_logged_in.write()
+                                                    {
                                                         *guard = true;
                                                     }
 
@@ -187,13 +193,19 @@ impl eframe::App for Launcher {
                                                         self.total_token_count.clone(),
                                                         self.automata.clone(),
                                                         self.config.clone(),
+                                                        self.trade_terminal.clone()
                                                     );
                                                     next_state = Some(AppState::Running(app));
                                                 } else {
-                                                    *error_msg = Some("Failed to write to key.json".to_string());
+                                                    *error_msg = Some(
+                                                        "Failed to write to key.json".to_string(),
+                                                    );
                                                 }
                                             }
-                                            Err(_) => *error_msg = Some("Failed to create key.json".to_string())
+                                            Err(_) => {
+                                                *error_msg =
+                                                    Some("Failed to create key.json".to_string())
+                                            }
                                         }
                                     }
                                     Err(_) => *error_msg = Some("Serialization error".to_string()),
@@ -213,7 +225,7 @@ impl eframe::App for Launcher {
                             if let Ok(mut guard) = self.is_logged_in.write() {
                                 *guard = false;
                             }
-                            
+
                             next_state = Some(AppState::Login {
                                 input_key: String::new(),
                                 error_msg: None,
@@ -270,6 +282,7 @@ pub struct MyApp {
 
     // cached feed so ui can keep showing last known items if lock fails
     pub cached_feed: Vec<Token>,
+    pub trade_terminal: Arc<RwLock<TradeTerminal>>,
 }
 
 impl MyApp {
@@ -280,6 +293,7 @@ impl MyApp {
         total: Arc<AtomicI64>,
         automata: Arc<Mutex<BuyAutomata>>,
         config: Option<AutoBuyConfig>,
+        trade_terminal : Arc<RwLock<TradeTerminal>>
     ) -> Self {
         // если конфиг есть, вытаскиваем значения, иначе пустые строки
         let (sol_input, fee_input, slip_input, bribe_input, filters_buy) =
@@ -372,14 +386,56 @@ impl MyApp {
             bribe_input,
 
             cached_feed: Vec::new(),
+            trade_terminal
         }
     }
 }
+
+use std::{fs, io};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TradeTerminal {
+    Axiom,
+    Padre,
+}
+
+impl TradeTerminal {
+    pub fn save_to_file(&self, path: &str) -> io::Result<()> {
+        let data = serde_json::to_string(self).unwrap();
+        fs::write(path, data)
+    }
+
+    pub fn load_from_file(path: &str) -> io::Result<Self> {
+        let data = fs::read_to_string(path)?;
+        let terminal = serde_json::from_str(&data).unwrap();
+        Ok(terminal)
+    }
+
+    pub fn url(&self, curve: &Pubkey) -> String {
+        match self {
+            TradeTerminal::Axiom => {
+                format!("https://axiom.trade/meme/{}", curve)
+            }
+            TradeTerminal::Padre => {
+                format!("https://trade.padre.gg/trade/solana/{}", curve)
+            }
+        }
+    }
+}
+
+
 
 impl Drop for MyApp {
     fn drop(&mut self) {
         let _ = self.filters.to_file("view_filters");
         let _ = self.filters_buy.to_file("buy_view_filters");
+    }
+}
+
+impl MyApp {
+    fn open_token(&self, curve: &Pubkey) {
+        let terminal = *self.trade_terminal.read().unwrap();
+        let _ = open::that(terminal.url(&curve));
     }
 }
 
@@ -410,9 +466,21 @@ impl eframe::App for MyApp {
             ui.add_space(10.0);
 
             if self.menu_open {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                        ui.label("terminal:");
+                        let mut current = *self.trade_terminal.read().unwrap();
+
+                        if ui.radio_value(&mut current, TradeTerminal::Axiom, "axiom").changed()
+                            || ui.radio_value(&mut current, TradeTerminal::Padre, "padre").changed()
+                        {
+                            *self.trade_terminal.write().unwrap() = current;
+                            let _ = self.trade_terminal.read().unwrap().save_to_file("./terminal.json");
+                        }
+                    });
+
                     // --- average market cap ---
-                    ui.label("average market cap range:");
+                    ui.label("median market cap range:");
 
                     let mut changed = false;
                     ui.horizontal(|ui| {
@@ -498,12 +566,12 @@ impl eframe::App for MyApp {
                             pool.filters = self.filters.clone();
                         }
                     }
+                    if let Ok(mut automata) = self.automata.try_lock() && automata.enabled {
+                        ui.separator();
+                        ui.heading("auto-buy config");
 
-                    ui.separator();
-                    ui.heading("auto-buy config");
-
-                    if let Ok(mut automata) = self.automata.try_lock() {
-                        ui.label("average market cap range:");
+                   
+                        ui.label("median market cap range:");
 
                         let mut changed = false;
                         ui.horizontal(|ui| {
@@ -604,6 +672,12 @@ impl eframe::App for MyApp {
                             automata.active_migrate = active;
                         }
 
+                        let mut active = automata.active_whitelist;
+                        if ui.checkbox(&mut active, "enabled whitelist").changed() {
+                            automata.active_whitelist = active;
+                            println!("{}", automata.active_whitelist);
+                        }
+
                         // lamports
                         if ui.text_edit_singleline(&mut self.sol_input).changed() {
                             if let Ok(val) = self.sol_input.parse::<f64>() {
@@ -679,15 +753,16 @@ impl eframe::App for MyApp {
                                 )
                                 .clicked()
                             {
-                                open_token(&token.curve);
+                                self.open_token(&token.curve);
                             }
 
                             ui.label(RichText::new(&token.name).italics());
                         });
 
                         ui.vertical(|ui| {
+                            if let Some(twitter) = token.twitter() {
                             ui.group(|ui| {
-                                if let Some(twitter) = token.twitter() {
+                                
                                     ui.set_min_width(140.0);
                                     ui.heading("twitter");
                                     if ui
@@ -722,8 +797,8 @@ impl eframe::App for MyApp {
                                             &twitter.id
                                         ));
                                     }
-                                }
-                            });
+                                });
+                            }
                         });
 
                         ui.vertical(|ui| {
@@ -763,7 +838,7 @@ impl eframe::App for MyApp {
 
                                     ui.label(
                                         RichText::new(format!(
-                                            "average ath: {}$",
+                                            "median ath: {}$",
                                             fmt.format(performance.average_ath as f64)
                                         ))
                                         .color(Color32::YELLOW)
@@ -787,19 +862,23 @@ impl eframe::App for MyApp {
                                                 .color(egui::Color32::YELLOW),
                                             );
 
+                                            let name = if token.name.is_empty() {
+                                                token.mint.to_string()
+                                            } else {
+                                                token.name.clone()
+                                            };
+
+
                                             if ui
                                                 .link(format!(
                                                     "{}",
-                                                    token
-                                                        .name
-                                                        .clone()
-                                                        .unwrap_or_else(|| token.mint.to_string())
+                                                    name
                                                 ))
                                                 .clicked()
                                             {
                                                 if let Ok(address) = Pubkey::from_str(&token.mint) {
                                                     let address = bounding_curve(&address).0;
-                                                    open_token(&address);
+                                                    self.open_token(&address);
                                                 }
                                             }
                                         });
@@ -845,10 +924,6 @@ impl eframe::App for MyApp {
 // ==============================================================================
 // 4. HELPERS
 // ==============================================================================
-
-fn open_token(curve: &Pubkey) {
-    let _ = open::that(&format!("https://axiom.trade/meme/{}", curve));
-}
 
 pub const PUMP_FUN: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 

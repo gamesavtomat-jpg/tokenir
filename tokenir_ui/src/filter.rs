@@ -74,7 +74,7 @@ impl FilterSet {
         let migration_ok = migration_pass.unwrap_or(false);
         let token_count_ok = token_count_pass.unwrap_or(false);
 
-        let result = mcap_ok || (migration_ok && token_count_ok);
+        let result = mcap_ok || ((migration_ok && token_count_ok) && token.dev_performance.is_none());
         result
     }
 }
