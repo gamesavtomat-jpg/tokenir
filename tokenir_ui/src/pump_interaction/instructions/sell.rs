@@ -37,7 +37,12 @@ impl Sell {
     }
 }
 
-pub fn sell(signer: &Keypair, token: &TokenAccounts, instruction: &Sell, token_2022 : bool) -> Instruction {
+pub fn sell(
+    signer: &Keypair,
+    token: &TokenAccounts,
+    instruction: &Sell,
+    token_2022: bool,
+) -> Instruction {
     let mint = *token.mint();
 
     let bonding_curve = *token.bonding_curve();

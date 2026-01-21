@@ -1,96 +1,134 @@
-use reqwest::{ClientBuilder, Url, cookie::Jar};
+use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
+use rmp_serde::{decode, encode};
 use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
-use std::{env, fmt, sync::Arc};
+use serde_json::Value;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::{env, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::sleep;
+use tokio_tungstenite::{
+    connect_async, tungstenite::client::IntoClientRequest, tungstenite::protocol::Message,
+};
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreatorHistory {
+    #[serde(flatten)]
     pub counts: Migrated,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Migrated {
-    pub totalCount: u64,
-    pub migratedCount: u64,
+    #[serde(alias = "tokensCreated")]
+    pub total_count: u64,
+    #[serde(alias = "tokensBonded")]
+    pub migrated_count: u64,
 }
 
-#[derive(Debug)]
-pub enum HistoryError {
-    RequestError(reqwest::Error),
-    JsonError(serde_json::Error),
-    Other(String),
-    EmptyResponse,
+pub struct PadreClient {
+    tx: mpsc::Sender<Message>,
+    pending_requests: Arc<DashMap<u32, oneshot::Sender<CreatorHistory>>>,
+    next_seq: Arc<AtomicU32>,
 }
 
-impl fmt::Display for HistoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HistoryError::RequestError(e) => write!(f, "HTTP request failed: {}", e),
-            HistoryError::JsonError(e) => write!(f, "JSON parse failed: {}", e),
-            HistoryError::Other(msg) => write!(f, "Other error: {}", msg),
-            HistoryError::EmptyResponse => write!(f, "empty responce"),
+impl PadreClient {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let (tx, mut rx) = mpsc::channel::<Message>(100);
+
+        // Fix: Explicit type annotation
+        let pending_requests: Arc<DashMap<u32, oneshot::Sender<CreatorHistory>>> =
+            Arc::new(DashMap::new());
+
+        let next_seq = Arc::new(AtomicU32::new(1000));
+        let pending_clone = pending_requests.clone();
+        let loop_tx = tx.clone();
+
+        tokio::spawn(async move {
+            let cookie = env::var("PADRE_COOKIE").unwrap_or_default();
+            let url = "wss://backend.padre.gg/_heavy_multiplex?desc=%2Ftrade%2Fsolana%2F3f2e2jJ7H5anAQkc1t7qYfapZnd4WbdUavJgBwtUfC3J";
+
+            loop {
+                let mut request = match url.into_client_request() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                let headers = request.headers_mut();
+                headers.insert("User-Agent", "Mozilla/5.0".parse().unwrap());
+                headers.insert("Origin", "https://trade.padre.gg".parse().unwrap());
+                headers.insert("Cookie", cookie.parse().unwrap());
+
+                if let Ok((ws_stream, _)) = connect_async(request).await {
+                    let (mut ws_writer, mut ws_reader) = ws_stream.split();
+                    loop {
+                        tokio::select! {
+                            Some(msg) = rx.recv() => {
+                                if ws_writer.send(msg).await.is_err() { break; }
+                            }
+                            msg_res = ws_reader.next() => {
+                                match msg_res {
+                                    Some(Ok(Message::Binary(bin))) => {
+                                        if bin.len() <= 2 {
+                                            let _ = loop_tx.send(Message::Binary(bin)).await;
+                                            continue;
+                                        }
+                                        if let Ok(raw_array) = decode::from_slice::<Vec<Value>>(&bin) {
+                                            if raw_array.len() >= 4 {
+                                                if let Some(seq) = raw_array[1].as_u64() {
+                                                    let seq_u32 = seq as u32;
+                                                    if let Some((_, sender)) = pending_clone.remove(&seq_u32) {
+                                                        if let Ok(history) = serde_json::from_value::<CreatorHistory>(raw_array[3].clone()) {
+                                                            let _ = sender.send(history);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                sleep(Duration::from_secs(1)).await; // Wait before reconnecting
+            }
+        });
+
+        Ok(Self {
+            tx,
+            pending_requests,
+            next_seq,
+        })
+    }
+
+    pub async fn get_dev_history(&self, dev_address: &str) -> Option<CreatorHistory> {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let route = format!("/dev-tokens/chain/SOLANA/dev/{}/get-dev-stats", dev_address);
+        let request_id = Uuid::new_v4().to_string();
+
+        let (otx, orx) = oneshot::channel();
+        self.pending_requests.insert(seq, otx);
+
+        let payload = (8, seq, route, request_id);
+        let mut buf = Vec::new();
+
+        if encode::write(&mut buf, &payload).is_ok() {
+            // This will buffer messages even if the connection is currently down
+            if self.tx.send(Message::Binary(buf)).await.is_err() {
+                return None;
+            }
         }
+
+        // Increased timeout slightly to allow for reconnection time
+        tokio::time::timeout(Duration::from_secs(5), orx)
+            .await
+            .ok()?
+            .ok()
     }
-}
-
-impl std::error::Error for HistoryError {}
-impl From<reqwest::Error> for HistoryError {
-    fn from(err: reqwest::Error) -> HistoryError {
-        HistoryError::RequestError(err)
-    }
-}
-impl From<serde_json::Error> for HistoryError {
-    fn from(err: serde_json::Error) -> HistoryError {
-        HistoryError::JsonError(err)
-    }
-}
-
-async fn refresh_access_token(jar: &Jar) -> Result<(), HistoryError> {
-    let jar = Arc::new(Jar::default());
-
-    let url = "https://api3.axiom.trade/refresh-access-token";
-    let client = reqwest::Client::builder()
-        .cookie_provider(jar.clone())
-        .build()
-        .unwrap();
-
-    let resp = client.post(url).send().await?;
-    if !resp.status().is_success() {
-        return Err(HistoryError::Other(format!(
-            "failed to refresh access token: {}",
-            resp.status()
-        )));
-    }
-    Ok(())
-}
-
-pub async fn get_user_created_coins(user: &Pubkey) -> Result<CreatorHistory, HistoryError> {
-    let request = format!("https://api3.axiom.trade/dev-tokens-v2?devAddress={}", user);
-
-    let jar = Arc::new(Jar::default());
-    jar.add_cookie_str(
-        &env::var("AXIOM_COOKIE").unwrap(),
-        &"https://api3.axiom.trade".parse::<Url>().unwrap(),
-    );
-
-    //refresh_access_token(&jar).await.unwrap();
-
-    let client = ClientBuilder::new()
-        .cookie_store(true)
-        .cookie_provider(jar.clone())
-        .build()
-        .unwrap();
-
-    //for attempt in 0..3 {
-    let response = client.get(&request).send().await?;
-
-    let body = response.text().await?;
-
-    let history: CreatorHistory = serde_json::from_str(&body)?;
-    if history.counts.totalCount != 0 || history.counts.migratedCount != 0 {
-        return Ok(history);
-    }
-    //}
-
-    Err(HistoryError::EmptyResponse)
 }

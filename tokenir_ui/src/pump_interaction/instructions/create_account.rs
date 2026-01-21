@@ -4,7 +4,9 @@ use solana_sdk::{
 };
 
 use crate::pump_interaction::constans::{
-    self, deriving::associated_token_address, programs::{ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, TOKEN_PROGRAM}
+    self,
+    deriving::associated_token_address,
+    programs::{ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, TOKEN_PROGRAM},
 };
 
 pub struct CreateAccount;
@@ -19,7 +21,7 @@ impl CreateAccount {
     }
 }
 
-pub fn create_account(wallet: &Pubkey, mint: &Pubkey, token_2022 : bool) -> Instruction {
+pub fn create_account(wallet: &Pubkey, mint: &Pubkey, token_2022: bool) -> Instruction {
     let (ata, _) = associated_token_address(wallet, mint, token_2022);
 
     let token_program = match token_2022 {

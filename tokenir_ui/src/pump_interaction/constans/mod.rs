@@ -36,17 +36,17 @@ pub mod deriving {
         Pubkey::find_program_address(seeds, &programs::PUMP_FUN)
     }
 
-pub fn associated_token_address(wallet: &Pubkey, mint: &Pubkey, token_2022 : bool) -> (Pubkey, u8) {
+    pub fn associated_token_address(
+        wallet: &Pubkey,
+        mint: &Pubkey,
+        token_2022: bool,
+    ) -> (Pubkey, u8) {
         let token_program = match token_2022 {
             true => programs::TOKEN_PROGRAM_2022,
             false => programs::TOKEN_PROGRAM,
         };
-        
-        let seeds = &[
-            wallet.as_ref(),
-            &token_program.to_bytes(),
-            mint.as_ref(),
-        ];
+
+        let seeds = &[wallet.as_ref(), &token_program.to_bytes(), mint.as_ref()];
         Pubkey::find_program_address(seeds, &programs::ASSOCIATED_TOKEN_PROGRAM)
     }
 

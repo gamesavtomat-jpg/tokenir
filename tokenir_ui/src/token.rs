@@ -20,9 +20,9 @@ pub struct Token {
     pub twitter: Option<CommunityInfo>,
     pub dev_performance: Option<DevPerformance>,
     pub migrated: Option<CreatorHistory>,
-    pub token_2022 : bool,
-    pub metadata_ipfs : Option<String>,
-    pub metadata: Option<Metadata>
+    pub token_2022: bool,
+    pub metadata_ipfs: Option<String>,
+    pub metadata: Option<Metadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +32,7 @@ pub struct Metadata {
     pub description: Option<String>,
     pub twitter: Option<String>,
     pub website: Option<String>,
-    pub image: Option<String>
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,12 +47,12 @@ pub struct DbToken {
     pub mint: String,
     pub dev_address: String,
     pub ath: i64,
-    pub name : String,
-    pub ticker : String,
-    pub ipfs : Option<String>,
-    pub image : Option<String>,
-    pub description : Option<String>,
-    pub community_id : Option<String>
+    pub name: String,
+    pub ticker: String,
+    pub ipfs: Option<String>,
+    pub image: Option<String>,
+    pub description: Option<String>,
+    pub community_id: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CommunityInfo {
@@ -113,9 +113,9 @@ impl Token {
         curve: Pubkey,
         twitter: Option<CommunityInfo>,
         mint: Pubkey,
-        token_2022 : bool,
-        metadata_ipfs : Option<String>,
-        metadata : Option<Metadata>
+        token_2022: bool,
+        metadata_ipfs: Option<String>,
+        metadata: Option<Metadata>,
     ) -> Self {
         Self {
             mint,
@@ -131,7 +131,7 @@ impl Token {
             migrated: None,
             token_2022,
             metadata_ipfs,
-            metadata
+            metadata,
         }
     }
 
@@ -145,28 +145,22 @@ impl Token {
     }
 
     pub fn dbtoken(&self, mint: Pubkey) -> DbToken {
-        let image = self.metadata
-            .as_ref()
-            .and_then(|m| m.image.clone());
-        
-        let description = self.metadata
-            .as_ref()
-            .and_then(|m| m.description.clone());
+        let image = self.metadata.as_ref().and_then(|m| m.image.clone());
 
-        let twitter = self.twitter
-            .as_ref()
-            .and_then(|t| Some(t.id.clone()));
-        
+        let description = self.metadata.as_ref().and_then(|m| m.description.clone());
+
+        let twitter = self.twitter.as_ref().and_then(|t| Some(t.id.clone()));
+
         DbToken {
             mint: mint.to_string(),
             dev_address: self.dev.to_string(),
             ath: self.usd_ath() as i64,
-            name : self.name.clone(),
-            ticker : self.ticker.clone(),
-            ipfs : self.metadata_ipfs.clone(),
-            image : image,
+            name: self.name.clone(),
+            ticker: self.ticker.clone(),
+            ipfs: self.metadata_ipfs.clone(),
+            image: image,
             description,
-            community_id: twitter
+            community_id: twitter,
         }
     }
 

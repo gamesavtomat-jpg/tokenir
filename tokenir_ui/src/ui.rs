@@ -68,7 +68,7 @@ impl Launcher {
         config: Option<AutoBuyConfig>,
         startup_tx: Sender<String>,
         is_logged_in: Arc<RwLock<bool>>, // New argument,
-        trade_terminal : Arc<RwLock<TradeTerminal>>
+        trade_terminal: Arc<RwLock<TradeTerminal>>,
     ) -> Self {
         // 1. Try to load key.json
         let loaded_key = if let Ok(mut file) = File::open("key.json") {
@@ -99,7 +99,7 @@ impl Launcher {
                 total.clone(),
                 automata.clone(),
                 config.clone(),
-                trade_terminal.clone()
+                trade_terminal.clone(),
             );
             AppState::Running(app)
         } else {
@@ -124,7 +124,7 @@ impl Launcher {
             config,
             startup_tx,
             is_logged_in,
-            trade_terminal
+            trade_terminal,
         }
     }
 }
@@ -193,7 +193,7 @@ impl eframe::App for Launcher {
                                                         self.total_token_count.clone(),
                                                         self.automata.clone(),
                                                         self.config.clone(),
-                                                        self.trade_terminal.clone()
+                                                        self.trade_terminal.clone(),
                                                     );
                                                     next_state = Some(AppState::Running(app));
                                                 } else {
@@ -218,20 +218,33 @@ impl eframe::App for Launcher {
 
             // --- MAIN APP ---
             AppState::Running(app) => {
+                // Inside AppState::Running(app) branch of Launcher::update
                 egui::TopBottomPanel::top("launcher_header").show(ctx, |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Logout").clicked() {
-                            // DISABLE BROWSER
-                            if let Ok(mut guard) = self.is_logged_in.write() {
-                                *guard = false;
-                            }
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        // ui.label("Wallet:");
+                        // let addr = &app.account_data.wallet_public_key;
+                        // let short_addr = format!("{}...{}", &addr[..6], &addr[addr.len()-6..]);
+                        // ui.label(RichText::new(short_addr).color(Color32::LIGHT_BLUE).strong());
 
-                            next_state = Some(AppState::Login {
-                                input_key: String::new(),
-                                error_msg: None,
-                            });
-                        }
+                        // // FIX IS HERE: ctx.copy_text
+                        // if ui.button("📋").on_hover_text("Copy Wallet Address").clicked() {
+                        //     ctx.copy_text(addr.clone());
+                        // }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Logout").clicked() {
+                                if let Ok(mut guard) = self.is_logged_in.write() {
+                                    *guard = false;
+                                }
+                                next_state = Some(AppState::Login {
+                                    input_key: String::new(),
+                                    error_msg: None,
+                                });
+                            }
+                        });
                     });
+                    ui.add_space(5.0);
                 });
                 app.update(ctx, frame);
             }
@@ -293,7 +306,7 @@ impl MyApp {
         total: Arc<AtomicI64>,
         automata: Arc<Mutex<BuyAutomata>>,
         config: Option<AutoBuyConfig>,
-        trade_terminal : Arc<RwLock<TradeTerminal>>
+        trade_terminal: Arc<RwLock<TradeTerminal>>,
     ) -> Self {
         // если конфиг есть, вытаскиваем значения, иначе пустые строки
         let (sol_input, fee_input, slip_input, bribe_input, filters_buy) =
@@ -386,7 +399,8 @@ impl MyApp {
             bribe_input,
 
             cached_feed: Vec::new(),
-            trade_terminal
+            trade_terminal,
+            //account_data
         }
     }
 }
@@ -422,8 +436,6 @@ impl TradeTerminal {
         }
     }
 }
-
-
 
 impl Drop for MyApp {
     fn drop(&mut self) {
@@ -466,16 +478,24 @@ impl eframe::App for MyApp {
             ui.add_space(10.0);
 
             if self.menu_open {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
                         ui.label("terminal:");
                         let mut current = *self.trade_terminal.read().unwrap();
 
-                        if ui.radio_value(&mut current, TradeTerminal::Axiom, "axiom").changed()
-                            || ui.radio_value(&mut current, TradeTerminal::Padre, "padre").changed()
+                        if ui
+                            .radio_value(&mut current, TradeTerminal::Axiom, "axiom")
+                            .changed()
+                            || ui
+                                .radio_value(&mut current, TradeTerminal::Padre, "padre")
+                                .changed()
                         {
                             *self.trade_terminal.write().unwrap() = current;
-                            let _ = self.trade_terminal.read().unwrap().save_to_file("./terminal.json");
+                            let _ = self
+                                .trade_terminal
+                                .read()
+                                .unwrap()
+                                .save_to_file("./terminal.json");
                         }
                     });
 
@@ -566,11 +586,12 @@ impl eframe::App for MyApp {
                             pool.filters = self.filters.clone();
                         }
                     }
-                    if let Ok(mut automata) = self.automata.try_lock() && automata.enabled {
+                    if let Ok(mut automata) = self.automata.try_lock()
+                        && automata.enabled
+                    {
                         ui.separator();
                         ui.heading("auto-buy config");
 
-                   
                         ui.label("median market cap range:");
 
                         let mut changed = false;
@@ -761,8 +782,7 @@ impl eframe::App for MyApp {
 
                         ui.vertical(|ui| {
                             if let Some(twitter) = token.twitter() {
-                            ui.group(|ui| {
-                                
+                                ui.group(|ui| {
                                     ui.set_min_width(140.0);
                                     ui.heading("twitter");
                                     if ui
@@ -813,13 +833,18 @@ impl eframe::App for MyApp {
                                 );
 
                                 if let Some(migrated) = &token.migrated {
+                                    let mut percent = ((migrated.counts.migrated_count as f32
+                                                / migrated.counts.total_count as f32)
+                                                * 100f32)
+                                                .round();
+                                    if percent.is_nan() {
+                                        percent = 0f32;
+                                    }
+                                    
                                     ui.label(
                                         RichText::new(format!(
                                             "{}%",
-                                            ((migrated.counts.migratedCount as f32
-                                                / migrated.counts.totalCount as f32)
-                                                * 100f32)
-                                                .round()
+                                            percent
                                         ))
                                         .color(Color32::LIGHT_GREEN)
                                         .font(FontId::proportional(16.0)),
@@ -868,14 +893,7 @@ impl eframe::App for MyApp {
                                                 token.name.clone()
                                             };
 
-
-                                            if ui
-                                                .link(format!(
-                                                    "{}",
-                                                    name
-                                                ))
-                                                .clicked()
-                                            {
+                                            if ui.link(format!("{}", name)).clicked() {
                                                 if let Ok(address) = Pubkey::from_str(&token.mint) {
                                                     let address = bounding_curve(&address).0;
                                                     self.open_token(&address);

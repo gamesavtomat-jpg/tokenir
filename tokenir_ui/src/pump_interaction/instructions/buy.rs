@@ -38,7 +38,12 @@ impl Buy {
     }
 }
 
-pub fn buy(signer: &Keypair, token: &TokenAccounts, instruction: &Buy, token_2022 : bool) -> Instruction {
+pub fn buy(
+    signer: &Keypair,
+    token: &TokenAccounts,
+    instruction: &Buy,
+    token_2022: bool,
+) -> Instruction {
     let mint = *token.mint();
 
     let bonding_curve = *token.bonding_curve();

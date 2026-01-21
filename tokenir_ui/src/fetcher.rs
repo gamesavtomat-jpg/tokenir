@@ -11,23 +11,17 @@ pub struct Client {
 #[serde(tag = "type")]
 enum ServerMessage {
     #[serde(rename = "connection_info")]
-    ConnectionInfo {
-        autobuy: bool,
-        message: String,
-    },
+    ConnectionInfo { autobuy: bool, message: String },
     #[serde(rename = "NewToken")]
-    NewToken {
-        data: Token,
-    },
+    NewToken { data: Token },
 }
-
 
 impl Client {
     pub fn new(url: String) -> Self {
         Self { url }
     }
 
-pub async fn subscribe<F, Fut>(&self, mut __func__: F) -> Result<(), std::io::Error>
+    pub async fn subscribe<F, Fut>(&self, mut __func__: F) -> Result<(), std::io::Error>
     where
         F: FnMut(Token, bool) -> Fut,
         Fut: Future<Output = ()>,
@@ -62,7 +56,10 @@ pub async fn subscribe<F, Fut>(&self, mut __func__: F) -> Result<(), std::io::Er
 
                 // Try to parse as ServerMessage first
                 match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(ServerMessage::ConnectionInfo { autobuy: ab, message }) => {
+                    Ok(ServerMessage::ConnectionInfo {
+                        autobuy: ab,
+                        message,
+                    }) => {
                         autobuy = ab;
                         println!("[client] {} (autobuy: {})", message, autobuy);
                     }

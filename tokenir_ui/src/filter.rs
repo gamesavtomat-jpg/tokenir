@@ -74,7 +74,8 @@ impl FilterSet {
         let migration_ok = migration_pass.unwrap_or(false);
         let token_count_ok = token_count_pass.unwrap_or(false);
 
-        let result = mcap_ok || ((migration_ok && token_count_ok) && token.dev_performance.is_none());
+        let result =
+            mcap_ok || ((migration_ok && token_count_ok) && token.dev_performance.is_none());
         result
     }
 }
@@ -100,7 +101,7 @@ impl Filters {
 
             Self::TokenCount(range) => {
                 if let Some(history) = &token.migrated {
-                    return range.contains(&history.counts.totalCount);
+                    return range.contains(&history.counts.total_count);
                 }
 
                 false
@@ -108,15 +109,20 @@ impl Filters {
 
             Self::MigrationPercentage(range) => {
                 if let Some(history) = &token.migrated {
-                    let percentage = ((history.counts.migratedCount as f32
-                        / history.counts.totalCount as f32)
-                        * 100f32)
-                        .floor() as u64;
+                    let percentage = if history.counts.total_count == 0 {
+                        0
+                    } else {
+                        ((history.counts.migrated_count as f32
+                            / history.counts.total_count as f32)
+                            * 100.0)
+                            .floor() as u64
+                    };
+
 
                     return range.contains(&percentage);
+                } else {
+                    return range.contains(&0);
                 }
-
-                return false;
             }
         }
     }
