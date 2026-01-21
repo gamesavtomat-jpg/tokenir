@@ -1,6 +1,6 @@
 use crate::{
-    Token,
     database::{Database, DbToken},
+    Token,
 };
 use solana_sdk::pubkey::Pubkey;
 use sqlx::{Pool, Postgres};

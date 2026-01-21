@@ -1,6 +1,6 @@
-use borsh::{BorshDeserialize, io};
-use solana_sdk::pubkey;
+use borsh::{io, BorshDeserialize};
 use solana_sdk::pubkey::Pubkey;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum Event {
@@ -19,6 +19,14 @@ impl Event {
     }
 }
 
+// Helper function for current timestamp in seconds
+fn current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateEvent {
     pub name: String,
@@ -28,6 +36,84 @@ pub struct CreateEvent {
     pub bonding_curve: Pubkey,
     pub user: Pubkey,
     pub token_2022: bool,
+    pub timestamp: i64,
+}
+
+impl TryFrom<PumpCreateEvent> for CreateEvent {
+    type Error = solana_sdk::pubkey::ParsePubkeyError;
+
+    fn try_from(e: PumpCreateEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: e.name,
+            symbol: e.symbol,
+            uri: e.uri,
+
+            // PumpPortal sends mint as base58 string
+            mint: Pubkey::from_str_const(&e.mint),
+
+            // PumpPortal does NOT expose bonding curve directly
+            // Pool is the best proxy
+            bonding_curve: Pubkey::from_str_const(&e.pool),
+
+            // PumpPortal does not expose creator/user reliably
+            // Use mint authority / zero fallback
+            user: Pubkey::default(),
+
+            // Pump.fun tokens are Token-2022 by default
+            token_2022: true,
+
+            // PumpPortal does not send timestamp → set locally
+            timestamp: current_timestamp(),
+        })
+    }
+}
+
+mod pubkey_from_string {
+    use serde::{Deserialize, Deserializer};
+    use solana_sdk::pubkey::Pubkey;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Pubkey, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Pubkey>().map_err(serde::de::Error::custom)
+    }
+}
+
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PumpCreateEvent {
+    pub signature: String,
+    pub mint: String,
+    #[serde(rename = "traderPublicKey")]
+    pub trader_public_key: String,
+    #[serde(rename = "txType")]
+    pub tx_type: String,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+
+    // Initial buy stats
+    #[serde(rename = "solAmount")]
+    pub sol_amount: f64,
+    #[serde(rename = "initialBuy")]
+    pub initial_buy: f64,
+    #[serde(rename = "marketCapSol")]
+    pub market_cap_sol: f64,
+
+    // Bonding curve details
+    #[serde(rename = "bondingCurveKey")]
+    pub bonding_curve_key: String,
+    #[serde(rename = "vTokensInBondingCurve")]
+    pub v_tokens_in_bonding_curve: f64,
+    #[serde(rename = "vSolInBondingCurve")]
+    pub v_sol_in_bonding_curve: f64,
+
+    // Extra flags
+    pub is_mayhem_mode: bool,
+    pub pool: String,
 }
 
 impl BorshDeserialize for CreateEvent {
@@ -38,11 +124,13 @@ impl BorshDeserialize for CreateEvent {
         let mint = Pubkey::deserialize_reader(reader)?;
         let bonding_curve = Pubkey::deserialize_reader(reader)?;
         let user = Pubkey::deserialize_reader(reader)?;
-
         let token_2022 = match bool::deserialize_reader(reader) {
             Ok(v) => v,
             Err(_) => false,
         };
+
+        // Set timestamp to current time if not in payload
+        let timestamp = current_timestamp();
 
         Ok(Self {
             name,
@@ -52,6 +140,7 @@ impl BorshDeserialize for CreateEvent {
             bonding_curve,
             user,
             token_2022,
+            timestamp,
         })
     }
 }
@@ -83,7 +172,9 @@ impl From<CreateEventV2> for CreateEvent {
             mint: v.mint,
             bonding_curve: v.bonding_curve,
             user: v.user,
-            token_2022: v.token_program == pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+            token_2022: v.token_program
+                == Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+            timestamp: v.timestamp, // carry over timestamp from V2
         }
     }
 }
@@ -124,6 +215,7 @@ pub struct TradeEvent {
     pub virtual_token_reserves: u64,
 }
 
+// AMM events
 #[derive(Clone, Debug, BorshDeserialize)]
 pub struct BuyEventAMM {
     pub timestamp: i64,
@@ -172,11 +264,11 @@ pub struct SellEventAMM {
     pub protocol_fee_recipient_token_account: Pubkey,
 }
 
+// Conversions from AMM
 impl From<BuyEventAMM> for BuyEvent {
     fn from(e: BuyEventAMM) -> Self {
-        //if base is more, spl is base
         if e.pool_base_token_reserves > e.pool_quote_token_reserves {
-            return BuyEvent {
+            BuyEvent {
                 mint: e.pool,
                 sol_amount: e.base_amount_out,
                 token_amount: e.quote_amount_in,
@@ -185,18 +277,18 @@ impl From<BuyEventAMM> for BuyEvent {
                 virtual_sol_reserves_before: e.pool_quote_token_reserves,
                 virtual_sol_reserves_after: e.pool_quote_token_reserves,
                 virtual_token_reserves: e.pool_base_token_reserves,
-            };
-        }
-        //in other case, sol is base
-        BuyEvent {
-            mint: e.pool,
-            sol_amount: e.base_amount_out,
-            token_amount: e.quote_amount_in,
-            user: e.user,
-            timestamp: e.timestamp,
-            virtual_sol_reserves_before: e.pool_base_token_reserves,
-            virtual_sol_reserves_after: e.pool_base_token_reserves,
-            virtual_token_reserves: e.pool_quote_token_reserves,
+            }
+        } else {
+            BuyEvent {
+                mint: e.pool,
+                sol_amount: e.base_amount_out,
+                token_amount: e.quote_amount_in,
+                user: e.user,
+                timestamp: e.timestamp,
+                virtual_sol_reserves_before: e.pool_base_token_reserves,
+                virtual_sol_reserves_after: e.pool_base_token_reserves,
+                virtual_token_reserves: e.pool_quote_token_reserves,
+            }
         }
     }
 }
@@ -204,7 +296,7 @@ impl From<BuyEventAMM> for BuyEvent {
 impl From<SellEventAMM> for SellEvent {
     fn from(e: SellEventAMM) -> Self {
         SellEvent {
-            mint: e.pool, // см. выше, проверь логику
+            mint: e.pool,
             sol_amount: e.base_amount_in,
             token_amount: e.quote_amount_out,
             user: e.user,

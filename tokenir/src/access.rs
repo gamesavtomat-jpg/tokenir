@@ -5,7 +5,7 @@ use sqlx::prelude::FromRow;
 pub struct AddUserPayload {
     pub provided_key: String,
     pub hint: String,
-    pub autobuy : bool
+    pub autobuy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -14,5 +14,5 @@ pub struct User {
     pub access_key: String,
     pub hint: String,
     pub admin: bool,
-    pub autobuy: bool
+    pub autobuy: bool,
 }

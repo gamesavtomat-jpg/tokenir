@@ -12,7 +12,7 @@ pub mod requests {
                 "mentions": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
             },
             {
-                "commitment": "confirmed"
+                "commitment": "processed"
             }
         ]
     }"#;
@@ -26,7 +26,7 @@ pub mod requests {
                 "mentions": ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"]
             },
             {
-                "commitment": "confirmed"
+                "commitment": "processed"
             }
         ]
     }"#;
@@ -49,7 +49,7 @@ pub mod requests {
         }
     }
 
-    use reqwest::{ClientBuilder, Url, cookie::Jar};
+    use reqwest::{cookie::Jar, ClientBuilder, Url};
 
     pub async fn get_user_created_coins(user: &Pubkey) -> Result<CreatorHistory, HistoryError> {
         let request = format!("https://api.axiom.trade/dev-tokens-v2?devAddress={}", user);
@@ -78,6 +78,8 @@ pub mod requests {
 pub mod helper {
     use std::env;
 
+    use futures::future::select_ok;
+    use futures::FutureExt;
     use reqwest::Client;
     use serde::Deserialize;
     use serde::Serialize;
@@ -184,73 +186,35 @@ pub mod helper {
             Error::SerdeJson(e)
         }
     }
+    pub async fn get_metadata(ipfs_url: &str, url: &str) -> Result<Metadata, Error> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| Error::SomeFuckedUpShit)?;
 
-    #[derive(Debug, Deserialize)]
-    struct ApiResponseTokenMetadata {
-        data: ApiData,
-    }
+        // 1. Resolve the URL: if it's IPFS, route it through our gateway
+        let final_url = if let Some(path) = url.strip_prefix("ipfs://") {
+            format!("{}/{}", ipfs_url.trim_end_matches('/'), path)
+        } else if let Some(path) = url.strip_prefix("https://ipfs.io/ipfs/") {
+            format!("{}/{}", ipfs_url.trim_end_matches('/'), path)
+        } else {
+            url.to_string()
+        };
 
-    #[derive(Debug, Deserialize)]
-    struct ApiData {
-        name: String,
-        symbol: String,
-        description: Option<String>,
-        logo: Option<String>,
-        socials: Option<Socials>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct Socials {
-        twitter: Option<String>,
-        website: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    pub struct MoralisMetaplex {
-        #[serde(rename = "metadataUri")]
-        pub metadata_uri: String,
-    }
-
-    #[derive(Debug, Deserialize)]
-    pub struct MoralisResponse {
-        pub metaplex: Option<MoralisMetaplex>,
-    }
-
-    pub async fn get_uri(mint: &Pubkey) -> Result<MoralisMetaplex, Error> {
-        let api_key = env::var("API_KEY_MORALIS").map_err(|_| Error::SomeFuckedUpShit)?;
-
-        let url = format!(
-            "https://solana-gateway.moralis.io/token/mainnet/{}/metadata",
-            mint
-        );
-
-        let client = Client::new();
-
-        let raw = client
-            .get(&url)
-            .header("X-API-Key", api_key)
-            .header("accept", "application/json")
-            .header("User-Agent", "reqwest") // <-- curl includes UA by default
+        // 2. Fetch and parse directly to JSON
+        let metadata = client
+            .get(&final_url)
             .send()
-            .await?
-            .text()
-            .await?;
+            .await
+            .map_err(|_| Error::SomeFuckedUpShit)?
+            .error_for_status() // Returns error if status is 4xx or 5xx
+            .map_err(|_| Error::SomeFuckedUpShit)?
+            .json::<Metadata>()
+            .await
+            .map_err(|_| Error::SomeFuckedUpShit)?;
 
-        println!("Moralis raw: {}", raw);
-
-        let response: MoralisResponse = serde_json::from_str(&raw)?;
-
-        response.metaplex.ok_or(Error::SomeFuckedUpShit)
-    }
-
-    pub async fn get_metadata(url: &str) -> Result<Metadata, Error> {
-        let response = reqwest::get(url).await?;
-        let body = response.text().await?;
-
-        let metadata: Metadata = serde_json::from_str(&body)?;
         Ok(metadata)
     }
-
     #[derive(Deserialize, Debug)]
     struct ApiResponse {
         community_info: CommunityInfo,

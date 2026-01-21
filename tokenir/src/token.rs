@@ -1,8 +1,13 @@
-use rust_decimal::{Decimal, dec};
+use rust_decimal::{dec, Decimal};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
-use crate::{Trade, constans::helper::{CommunityInfo, pool_pda}, database::DbToken, requests::Metadata};
+use crate::{
+    constans::helper::{pool_pda, CommunityInfo},
+    database::DbToken,
+    requests::Metadata,
+    Trade,
+};
 
 const FRESH_MARKET_CAP: u64 = 3264;
 
@@ -100,12 +105,12 @@ impl Token {
             image: image,
             description,
             community_id: twitter,
-            pool_address : pool_pda(&mint).0.to_string()
+            pool_address: pool_pda(&mint).0.to_string(),
         }
     }
 }
 
-pub fn usd_mcap(mcap : u64, reserves : u64, price: u64) -> u64 {
+pub fn usd_mcap(mcap: u64, reserves: u64, price: u64) -> u64 {
     let mcap = mcap as u128;
     (mcap.saturating_mul(price as u128 * 1000000) / reserves as u128) as u64
 }

@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use sqlx::{PgPool, Pool, Postgres, Row, Transaction, postgres::PgPoolOptions, prelude::FromRow};
+use sqlx::{postgres::PgPoolOptions, prelude::FromRow, PgPool, Pool, Postgres, Row, Transaction};
 
 use crate::{
+    access::{AddUserPayload, User},
+    constans::helper::pool_pda,
     Token,
-    access::{AddUserPayload, User}, constans::helper::pool_pda,
 };
 
 pub struct Database {
@@ -42,7 +43,7 @@ impl Database {
             WHERE dev_address = $1
             "#,
         )
-        .bind(dev_address)
+        .bind(clean(dev_address))
         .fetch_one(&self.pool)
         .await?;
 
@@ -68,7 +69,7 @@ impl Database {
             LIMIT $2
             "#,
         )
-        .bind(dev_address)
+        .bind(clean(dev_address))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -78,7 +79,7 @@ impl Database {
 
     pub async fn validate_user_key(&self, key: &str) -> Result<bool, sqlx::Error> {
         let result: Option<(i32,)> = sqlx::query_as("SELECT id FROM users WHERE access_key = $1")
-            .bind(key)
+            .bind(clean(key))
             .fetch_optional(self.connection())
             .await?;
 
@@ -91,7 +92,7 @@ impl Database {
         payload: AddUserPayload,
     ) -> Result<(), sqlx::Error> {
         let is_admin: (bool,) = sqlx::query_as("SELECT admin FROM users WHERE access_key = $1")
-            .bind(caller_admin_key)
+            .bind(clean(caller_admin_key))
             .fetch_one(self.connection())
             .await?;
 
@@ -111,8 +112,8 @@ impl Database {
             VALUES ($1, $2, false, $3)
             "#,
         )
-        .bind(payload.provided_key)
-        .bind(payload.hint)
+        .bind(clean(payload.provided_key))
+        .bind(clean(payload.hint))
         .bind(payload.autobuy)
         .execute(self.connection())
         .await?;
@@ -122,7 +123,7 @@ impl Database {
 
     pub async fn get_user_autobuy_status(&self, key: &str) -> Result<bool, sqlx::Error> {
         let result: (bool,) = sqlx::query_as("SELECT autobuy FROM users WHERE access_key = $1")
-            .bind(key)
+            .bind(clean(key))
             .fetch_one(self.connection())
             .await?;
 
@@ -135,7 +136,7 @@ impl Database {
         user_id: i32,
     ) -> Result<(), sqlx::Error> {
         let is_admin: (bool,) = sqlx::query_as("SELECT admin FROM users WHERE access_key = $1")
-            .bind(caller_admin_key)
+            .bind(clean(caller_admin_key))
             .fetch_one(self.connection())
             .await?;
 
@@ -170,9 +171,10 @@ impl Database {
             return Err(sqlx::Error::RowNotFound);
         }
 
-        let users = sqlx::query_as::<_, User>("SELECT id, access_key, hint, admin, autobuy FROM users")
-            .fetch_all(self.connection())
-            .await?;
+        let users =
+            sqlx::query_as::<_, User>("SELECT id, access_key, hint, admin, autobuy FROM users")
+                .fetch_all(self.connection())
+                .await?;
 
         Ok(users)
     }
@@ -270,7 +272,6 @@ impl Database {
         dev_address: String,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.connection().begin().await?;
-        println!("{:?}", &token.community_id);
         sqlx::query(
             r#"
             INSERT INTO devs (dev_address, total_token_count)
@@ -279,7 +280,7 @@ impl Database {
             DO UPDATE SET total_token_count = devs.total_token_count + 1
             "#,
         )
-        .bind(&dev_address)
+        .bind(clean(&dev_address))
         .execute(&mut *tx)
         .await?;
 
@@ -303,20 +304,19 @@ impl Database {
         .bind(mint.to_string())
         .bind(&dev_address)
         .bind(token.ath)
-        .bind(&token.name)
-        .bind(&token.ticker)
-        .bind(&token.ipfs)
-        .bind(&token.image)
-        .bind(&token.description)
-        .bind(&token.community_id)
-        .bind(&token.pool_address) // bind new field
+        .bind(clean(&token.name))
+        .bind(clean(&token.ticker))
+        .bind(clean_opt(token.ipfs.clone()))
+        .bind(clean_opt(token.image.clone()))
+        .bind(clean_opt(token.description.clone()))
+        .bind(&clean_opt(token.community_id.clone()))
+        .bind(&clean(token.pool_address.clone())) // bind new field
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
         Ok(())
     }
-
 
     // возвращаем token_any_exists к прежнему виду без community_id
     pub async fn token_any_exists(
@@ -336,7 +336,6 @@ impl Database {
                    OR ($3 IS NOT NULL AND $6 IS NOT NULL AND description = $3 AND name = $6)
                    OR ($3 IS NOT NULL AND $7 IS NOT NULL AND description = $3 AND ticker = $7)
                    OR ($4 IS NOT NULL AND $5 IS NOT NULL AND name = $4 AND ticker = $5)
-                   OR ($4 IS NOT NULL AND EXISTS(SELECT 1 FROM tokens WHERE name = $4))
             )
             "#,
         )
@@ -368,7 +367,7 @@ impl Database {
             LIMIT $3
             "#,
         )
-        .bind(dev_address)
+        .bind(clean(dev_address))
         .bind(exclude_mint)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -392,7 +391,7 @@ impl Database {
             WHERE dev_address = $1 AND mint != $2
             "#,
         )
-        .bind(dev_address)
+        .bind(clean(dev_address))
         .bind(exclude_mint)
         .fetch_one(&self.pool)
         .await?;
@@ -401,7 +400,7 @@ impl Database {
         let count: i64 = row.get("count");
 
         Ok(median.map(|m| (m, count as usize)))
-    }        
+    }
 
     pub async fn token_community_exists(&self, community_id: &str) -> Result<bool, sqlx::Error> {
         let row: Option<(bool,)> = sqlx::query_as(
@@ -422,7 +421,7 @@ impl Database {
     pub async fn update_token_ath(
         &self,
         pool_address: &Pubkey,
-        ath : i64,
+        ath: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -458,13 +457,12 @@ impl Database {
             ORDER BY created_at DESC
             "#,
         )
-        .bind(dev_address)
+        .bind(clean(dev_address))
         .fetch_all(self.connection())
         .await?;
 
         Ok(tokens)
     }
-
 
     pub async fn get_total_coin_count(&self) -> Result<i64, sqlx::Error> {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens")
@@ -486,5 +484,13 @@ pub struct DbToken {
     pub image: Option<String>,
     pub description: Option<String>,
     pub community_id: Option<String>,
-    pub pool_address : String
+    pub pool_address: String,
+}
+
+fn clean(s: impl AsRef<str>) -> String {
+    s.as_ref().replace('\0', "").trim().to_string()
+}
+
+fn clean_opt(s: Option<impl AsRef<str>>) -> Option<String> {
+    s.map(|v| v.as_ref().replace('\0', "").trim().to_string())
 }
